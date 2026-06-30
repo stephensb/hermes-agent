@@ -1,0 +1,97 @@
+# OBi200 → Asterisk → Hermes voice bridge
+
+Lift the handset on an OBi200 (or any SIP ATA) and you're talking to Hermes.
+This directory holds the Asterisk-side configuration; the Hermes-side adapter
+lives in `../adapter.py`.
+
+```
+OBi200 (analog phone)                Asterisk PBX                 Hermes gateway
+  off-hook auto-dials ──SIP──▶  registrar + Stasis dialplan
+                                     │  ARI events + REST  ◀──────▶  SIPAdapter
+                                     │  externalMedia (AudioSocket/TCP, 8 kHz SLIN)
+                                     └────────── media ───────────▶  VAD→STT→agent→TTS
+```
+
+## 1. Asterisk
+
+Requires Asterisk 16+ with `res_ari`, `res_pjsip`, and `app_audiosocket`
+(ships with modern Asterisk; `asterisk -rx "module show like audiosocket"`).
+
+1. **ARI / HTTP** — enable the HTTP server in `/etc/asterisk/http.conf`:
+
+   ```ini
+   [general]
+   enabled = yes
+   bindaddr = 0.0.0.0
+   bindport = 8088
+   ```
+
+   Then merge `ari.conf` here into `/etc/asterisk/ari.conf`. The `[hermes]`
+   user's name/password become `SIP_ARI_USER` / `SIP_ARI_PASSWORD`.
+
+2. **PJSIP endpoint** — merge `pjsip.conf` here into
+   `/etc/asterisk/pjsip.conf`. Pick a real password for `obi200-auth`.
+
+3. **Dialplan** — merge `extensions.conf` here into
+   `/etc/asterisk/extensions.conf`. The `Stasis(hermes)` app name must equal
+   `SIP_STASIS_APP` (default `hermes`).
+
+4. Reload: `asterisk -rx "core reload"`.
+
+## 2. OBi200
+
+On stock firmware (no third-party flash needed):
+
+1. **Service Provider (ITSP Profile / Voice Service → SP1)** — point it at
+   Asterisk:
+   - ProxyServer = Asterisk host/IP, ProxyServerPort = `5060`
+   - AuthUserName = `obi200`, AuthPassword = the `obi200-auth` password
+   - X_RegisterEnable = checked
+2. **Auto-dial on off-hook** — under `Physical Interfaces → PHONE1 Port`, set
+   `PrimaryLine = SP1`, and set the **DigitMap** / `OffHook AutoDial` so lifting
+   the receiver immediately calls your Stasis target. The simplest is an
+   off-hook hotline: set Port → `DigitMap` to a fixed string (e.g. `100`) and
+   enable auto-dial, or set `OutboundCallRoute` to `{ph:100@SP1}`. `100` (or
+   whatever you choose) just needs to match a dialplan extension — the
+   `_X.` pattern in `extensions.conf` accepts any.
+
+Lift the handset → the OBi200 registers/dials SP1 → Asterisk runs
+`Stasis(hermes)` → the call connects to Hermes.
+
+## 3. Hermes
+
+Install the extra and set the environment (or run `hermes gateway setup` and
+pick SIP):
+
+```bash
+pip install hermes-agent[sip]      # numpy; aiohttp + ffmpeg already present
+
+export SIP_ARI_URL=http://ASTERISK_HOST:8088
+export SIP_ARI_USER=hermes
+export SIP_ARI_PASSWORD=...        # matches ari.conf
+export SIP_STASIS_APP=hermes
+export SIP_AUDIOSOCKET_ADVERTISE_HOST=HERMES_HOST   # reachable from Asterisk
+export SIP_AUDIOSOCKET_PORT=9092
+export SIP_ALLOWED_USERS=          # caller numbers; or SIP_ALLOW_ALL_USERS=true
+
+hermes gateway start
+```
+
+`SIP_AUDIOSOCKET_ADVERTISE_HOST` is the address **Asterisk** dials back to for
+media, so it must be routable from the PBX to the Hermes host (use `127.0.0.1`
+only when both run on the same machine). The bind host/port is where the
+adapter listens.
+
+## Notes & tuning
+
+- **Codec**: the OBi200↔Asterisk leg uses G.711 (`ulaw`/`alaw`); Asterisk
+  transcodes to 8 kHz signed-linear for AudioSocket. No codec config is needed
+  on the Hermes side.
+- **Turn-taking**: a caller's turn ends after `SIP_VAD_SILENCE_SECONDS` (1.5s
+  default) of silence below `SIP_VAD_SILENCE_RMS` (200). Raise the RMS on a
+  noisy line; lengthen the silence if callers get cut off mid-thought.
+- **Latency**: long agent turns (tool calls, memory recall) feel bad on a phone.
+  The adapter's platform hint already asks for short spoken replies; for the
+  snappiest experience pair SIP with a fast model and a lean toolset.
+- STT/TTS use whatever providers the gateway is configured with
+  (`tools/transcription_tools.py`, `tools/tts_tool.py`).

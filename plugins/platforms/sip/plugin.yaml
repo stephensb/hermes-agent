@@ -1,0 +1,62 @@
+name: sip-platform
+label: SIP
+kind: platform
+version: 1.0.0
+description: >
+  SIP voice-bridge adapter for Hermes Agent. Lets an analog phone behind a SIP
+  ATA (e.g. a Poly/OBi200) hold a live spoken conversation with Hermes. The
+  phone registers and dials into an Asterisk PBX; Asterisk runs a Stasis
+  dialplan that hands the call to this adapter over ARI (call control) and
+  AudioSocket/TCP (8 kHz signed-linear media). Caller speech is detected with a
+  VAD turn-taker, transcribed, run through the shared agent loop, and the reply
+  is synthesized back onto the call. See asterisk/README.md for PBX + OBi200
+  wiring. Requires the [sip] extra (numpy) plus aiohttp and ffmpeg.
+author: Nous Research
+# ``requires_env`` entries are surfaced in ``hermes config`` UI via the
+# platform-plugin env var injector in ``hermes_cli/config.py``.
+requires_env:
+  - name: SIP_ARI_URL
+    description: "Asterisk ARI base URL (e.g. http://127.0.0.1:8088)"
+    prompt: "ARI base URL"
+    password: false
+  - name: SIP_ARI_USER
+    description: "ARI username (from Asterisk ari.conf)"
+    prompt: "ARI username"
+    password: false
+  - name: SIP_ARI_PASSWORD
+    description: "ARI password (from Asterisk ari.conf)"
+    prompt: "ARI password"
+    password: true
+optional_env:
+  - name: SIP_STASIS_APP
+    description: "Stasis application name registered with Asterisk (default: hermes)"
+    prompt: "Stasis app name"
+    password: false
+  - name: SIP_AUDIOSOCKET_HOST
+    description: "Local bind host for the AudioSocket TCP media server (default: 0.0.0.0)"
+    prompt: "AudioSocket bind host"
+    password: false
+  - name: SIP_AUDIOSOCKET_PORT
+    description: "Local bind port for the AudioSocket TCP media server (default: 9092)"
+    prompt: "AudioSocket port"
+    password: false
+  - name: SIP_AUDIOSOCKET_ADVERTISE_HOST
+    description: "Address Asterisk connects back to for media — must be reachable from the PBX (default: 127.0.0.1)"
+    prompt: "AudioSocket advertise host"
+    password: false
+  - name: SIP_ALLOWED_USERS
+    description: "Comma-separated caller numbers allowed to talk to Hermes"
+    prompt: "Allowed caller numbers (comma-separated)"
+    password: false
+  - name: SIP_ALLOW_ALL_USERS
+    description: "Allow any caller to talk to Hermes (dev only)"
+    prompt: "Allow all callers? (true/false)"
+    password: false
+  - name: SIP_VAD_SILENCE_RMS
+    description: "End-of-turn silence RMS threshold (int16 scale, default: 200)"
+    prompt: "VAD silence RMS threshold"
+    password: false
+  - name: SIP_VAD_SILENCE_SECONDS
+    description: "Seconds of silence that end a caller's turn (default: 1.5)"
+    prompt: "VAD silence seconds"
+    password: false
