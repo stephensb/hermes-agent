@@ -12,6 +12,10 @@ OBi200 (analog phone)                Asterisk PBX                 Hermes gateway
                                      └────────── media ───────────▶  VAD→STT→agent→TTS
 ```
 
+> **Just want to test it?** The `../e2e/` directory has a Docker Compose harness
+> that runs Asterisk + Hermes + a simulated OBi200 (sipp) and places a real
+> call end-to-end — no hardware needed. See `../e2e/README.md`.
+
 ## 1. Asterisk
 
 Requires Asterisk 16+ with `res_ari`, `res_pjsip`, and `app_audiosocket`

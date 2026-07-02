@@ -1,0 +1,109 @@
+# End-to-end test harness for the Hermes SIP voice bridge.
+#
+#   OBi200 (simulated by sipp) ──SIP/RTP──▶ Asterisk ──ARI + AudioSocket──▶ Hermes
+#
+# Three services on one bridge network:
+#   * asterisk — PBX with the plugin's config templates + ARI/AudioSocket.
+#   * hermes   — the gateway built from this repo with the SIP plugin enabled.
+#   * caller   — sipp, registers as the OBi200 and places a call carrying a
+#                spoken WAV so Hermes actually transcribes something.
+#
+# Quick start (from this directory):
+#   cp hermes.env.example hermes.env      # add a model/provider key for a full
+#                                         # conversational run (optional)
+#   docker compose up --build -d asterisk hermes
+#   docker compose logs -f hermes         # watch for "connected to ARI"
+#   docker compose run --rm caller        # place one test call
+#
+# See README.md for what each stage validates and how to read the logs.
+
+name: hermes-sip-e2e
+
+services:
+  asterisk:
+    build:
+      context: .
+      dockerfile: asterisk/Dockerfile
+    container_name: hermes-e2e-asterisk
+    # Mount the plugin's config templates read-only so editing them under
+    # ../asterisk/ takes effect on `docker compose restart asterisk` without
+    # a rebuild.
+    volumes:
+      - ../asterisk/pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ../asterisk/extensions.conf:/etc/asterisk/extensions.conf:ro
+      - ../asterisk/ari.conf:/etc/asterisk/ari.conf:ro
+      - ../asterisk/http.conf:/etc/asterisk/http.conf:ro
+    # 5060 (SIP) and the RTP range are only needed between asterisk and the
+    # caller, which share this network — no host ports required.  8088 (ARI)
+    # is exposed to the host for debugging (curl http://localhost:8088/ari).
+    ports:
+      - "127.0.0.1:8088:8088"
+    healthcheck:
+      # ARI answers 401 without creds — proves the HTTP/ARI stack is up.
+      test: ["CMD", "sh", "-c", "curl -sf -o /dev/null -w '%{http_code}' http://localhost:8088/ari/asterisk/info | grep -q 401"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [sipnet]
+
+  hermes:
+    build:
+      context: ../../../..          # repo root (Dockerfile lives there)
+      dockerfile: Dockerfile
+    image: hermes-agent
+    container_name: hermes-e2e-gateway
+    depends_on:
+      asterisk:
+        condition: service_healthy
+    env_file:
+      - hermes.env                  # your model/provider key (see .example)
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      # SIP plugin wiring — matches the mounted Asterisk config.
+      - SIP_ARI_URL=http://asterisk:8088
+      - SIP_ARI_USER=hermes
+      - SIP_ARI_PASSWORD=change-me
+      - SIP_STASIS_APP=hermes
+      - SIP_AUDIOSOCKET_HOST=0.0.0.0
+      - SIP_AUDIOSOCKET_PORT=9092
+      # Address Asterisk dials back to for media — the hermes service name,
+      # resolvable on the compose network.
+      - SIP_AUDIOSOCKET_ADVERTISE_HOST=hermes
+      # Open access for the test; lock down with SIP_ALLOWED_USERS in prod.
+      - SIP_ALLOW_ALL_USERS=true
+      # Allow the [sip] extra (aiohttp + numpy) to lazy-install if the image
+      # didn't bake it in.
+      - HERMES_DISABLE_LAZY_INSTALLS=0
+    # Persist config/logs so `docker compose run hermes hermes doctor` etc.
+    # work across restarts.
+    volumes:
+      - hermes-data:/opt/data
+    networks: [sipnet]
+
+  caller:
+    build:
+      context: ./caller
+      dockerfile: Dockerfile
+    container_name: hermes-e2e-caller
+    depends_on:
+      asterisk:
+        condition: service_healthy
+    # Overridable: which extension to dial and what to "say".
+    environment:
+      - ASTERISK_HOST=asterisk
+      - SIP_USER=obi200
+      - SIP_PASSWORD=change-me
+      - DIAL_EXT=100
+      - SAY=hello hermes, what time is it
+      - CALL_SECONDS=8
+    networks: [sipnet]
+    # Not started by `up`; invoke on demand with `docker compose run --rm caller`.
+    profiles: [manual]
+
+networks:
+  sipnet:
+    driver: bridge
+
+volumes:
+  hermes-data:
