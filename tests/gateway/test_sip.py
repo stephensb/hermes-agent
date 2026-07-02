@@ -64,6 +64,26 @@ def _frame(amplitude: int) -> bytes:
     return _pcm(amplitude, SLIN_FRAME_BYTES // 2)
 
 
+async def _cancel(*tasks):
+    """Cancel and await background tasks so no 'pending task' warnings leak."""
+    for t in tasks:
+        if t is not None and not t.done():
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+
+async def _drain_until(predicate, *, steps: int = 200):
+    """Yield to the loop until *predicate* is true or *steps* elapse."""
+    for _ in range(steps):
+        if predicate():
+            return True
+        await asyncio.sleep(0)
+    return predicate()
+
+
 # ── AudioSocket framing ────────────────────────────────────────────────────
 
 class TestAudioSocketFraming:
@@ -419,13 +439,13 @@ class TestStasisStart:
     @pytest.mark.asyncio
     async def test_happy_path_answers_bridges_and_maps_uuid(self):
         adapter = _make_adapter(audiosocket_advertise_host="10.0.0.5",
-                                audiosocket_port=9092)
+                                audiosocket_port=9092, allow_all_users="true")
         calls = []
 
-        async def fake_ari(method, path, params=None):
+        async def fake_ari(method, path, params=None, quiet_404=False):
             calls.append((method, path, params))
             if path == "channels/externalMedia":
-                return {"id": "ext-1"}
+                return {"id": params.get("channelId")}
             if path == "bridges":
                 return {"id": "br-1"}
             return None
@@ -437,12 +457,18 @@ class TestStasisStart:
 
         call = adapter._calls["chan-A"]
         assert call.caller == "5551234"
-        assert call.external_channel_id == "ext-1"
+        # The externalMedia channel id is pre-assigned (registered before the
+        # POST) so the media leg's StasisStart can't be misclassified.
+        ext_id = f"sip-media-{call.media_uuid}"
+        assert call.external_channel_id == ext_id
+        assert ext_id in adapter._external_channels
+        assert adapter._external_owner[ext_id] == "chan-A"
         assert call.bridge_id == "br-1"
         # UUID mapped for the AudioSocket handshake.
         assert adapter._uuid_to_channel[call.media_uuid] == "chan-A"
         # externalMedia was asked for AudioSocket/TCP/slin with our advertise host.
         em = next(p for m, pth, p in calls if pth == "channels/externalMedia")
+        assert em["channelId"] == ext_id
         assert em["encapsulation"] == "audiosocket"
         assert em["transport"] == "tcp"
         assert em["format"] == "slin"
@@ -450,15 +476,41 @@ class TestStasisStart:
         assert em["data"] == call.media_uuid
         # Both legs were added to the mixing bridge.
         add = next(p for m, pth, p in calls if pth.endswith("/addChannel"))
-        assert add["channel"] == "chan-A,ext-1"
+        assert add["channel"] == f"chan-A,{ext_id}"
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_caller_rejected_before_answer(self):
+        # Default (no allowlist, no allow-all): the caller is hung up at
+        # StasisStart and the call is never answered or bridged.
+        adapter = _make_adapter()
+        adapter._ari_request = AsyncMock(return_value=None)
+        await adapter._on_stasis_start(
+            {"channel": {"id": "chan-Z", "name": "PJSIP/obi200",
+                         "caller": {"number": "5559999"}}})
+        assert "chan-Z" not in adapter._calls
+        # Only the reject-hangup DELETE fired — no answer, no externalMedia.
+        methods = [c.args[:2] for c in adapter._ari_request.await_args_list]
+        assert methods == [("DELETE", "channels/chan-Z")]
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_caller_admitted(self):
+        adapter = _make_adapter(allowed_users="5551234")
+        adapter._ari_request = AsyncMock(return_value=None)
+        await adapter._on_stasis_start(
+            {"channel": {"id": "chan-Y", "name": "PJSIP/obi200",
+                         "caller": {"number": "5551234"}}})
+        # Admitted → answer was attempted (call created before externalMedia None).
+        assert any(c.args[:2] == ("POST", "channels/chan-Y/answer")
+                   for c in adapter._ari_request.await_args_list)
 
     @pytest.mark.asyncio
     async def test_external_media_failure_ends_call(self):
-        adapter = _make_adapter()
+        adapter = _make_adapter(allow_all_users="true")
         adapter._ari_request = AsyncMock(return_value=None)  # answer + externalMedia both None
         adapter._end_call = AsyncMock()
         await adapter._on_stasis_start(
-            {"channel": {"id": "chan-B", "name": "PJSIP/obi200", "caller": {}}})
+            {"channel": {"id": "chan-B", "name": "PJSIP/obi200",
+                         "caller": {"number": "555"}}})
         adapter._end_call.assert_awaited_once_with("chan-B", hangup=True)
 
     @pytest.mark.asyncio
@@ -483,7 +535,8 @@ class TestStasisStart:
 
 class TestAudioSocketMedia:
 
-    def test_attach_media_maps_uuid_and_arms_detector(self):
+    @pytest.mark.asyncio
+    async def test_attach_media_maps_uuid_and_starts_pipeline(self):
         adapter = _make_adapter()
         call = _Call("chan-1", "555")
         adapter._calls["chan-1"] = call
@@ -494,7 +547,9 @@ class TestAudioSocketMedia:
         attached = adapter._attach_media(raw, writer)
         assert attached is call
         assert call.writer is writer
-        assert call.detector.silence_rms == adapter.vad_silence_rms
+        # The synthesis + playout pipeline tasks were started for the call.
+        assert call.synth_task is not None and call.playout_task is not None
+        await _cancel(call.synth_task, call.playout_task)
 
     def test_attach_media_unknown_uuid_returns_none(self):
         adapter = _make_adapter()
@@ -540,8 +595,11 @@ class TestAudioSocketMedia:
 
         assert call.writer is writer            # UUID frame attached the socket
         assert routed == [("chan-1", b"\x00" * 320)]
-        adapter._end_call.assert_awaited_once_with("chan-1", hangup=False)
+        # An AudioSocket 0x00 hangup frame tears the whole call down.
+        adapter._end_call.assert_awaited_once_with("chan-1", hangup=True)
         assert writer.closed
+        # _attach_media started the playback pipeline; stop it.
+        await _cancel(call.synth_task, call.playout_task)
 
 
 # ── Utterance → STT → agent ────────────────────────────────────────────────
@@ -596,38 +654,40 @@ class TestSendAndPlayback:
         assert res.success is False
 
     @pytest.mark.asyncio
-    async def test_send_schedules_playback(self):
+    async def test_send_enqueues_reply(self):
+        # send() enqueues (it does not cancel/replace) so multiple replies in
+        # one turn are spoken in order rather than truncating each other.
         adapter = _make_adapter()
         call = _Call("chan-1", "555")
         call.writer = _FakeWriter()
         adapter._calls["chan-1"] = call
-        spoken = {}
-        adapter._speak = AsyncMock(side_effect=lambda c, t: spoken.update(text=t))
-        res = await adapter.send("chan-1", "Hello there.")
-        assert res.success is True
-        await call.playback_task
-        assert spoken["text"] == "Hello there."
+        assert (await adapter.send("chan-1", "First reply.")).success is True
+        assert (await adapter.send("chan-1", "Second reply.")).success is True
+        assert call.say_queue.get_nowait() == "First reply."
+        assert call.say_queue.get_nowait() == "Second reply."
 
     @pytest.mark.asyncio
-    async def test_send_empty_content_no_playback(self):
+    async def test_send_empty_content_no_enqueue(self):
         adapter = _make_adapter()
         call = _Call("chan-1", "555")
         call.writer = _FakeWriter()
         adapter._calls["chan-1"] = call
-        adapter._speak = AsyncMock()
         res = await adapter.send("chan-1", "   ")
         assert res.success is True
-        adapter._speak.assert_not_called()
+        assert call.say_queue.empty()
 
     @pytest.mark.asyncio
-    async def test_speak_synthesizes_each_sentence(self):
+    async def test_synth_loop_synthesizes_each_sentence(self):
         adapter = _make_adapter()
         call = _Call("chan-1", "555")
         adapter._synthesize_slin = AsyncMock(return_value=b"\x00" * 320)
-        adapter._stream_frames = AsyncMock()
-        await adapter._speak(call, "First. Second!")
+        call.say_queue.put_nowait("First. Second!")
+        task = asyncio.create_task(adapter._synth_loop(call))
+        await _drain_until(lambda: adapter._synthesize_slin.await_count >= 2)
+        await _cancel(task)
+        # One TTS call per sentence; each produced PCM was queued for playout.
         assert adapter._synthesize_slin.await_count == 2
-        assert adapter._stream_frames.await_count == 2
+        assert call.pcm_queue.qsize() == 2
 
     @pytest.mark.asyncio
     async def test_stream_frames_writes_framed_slin(self):
@@ -922,11 +982,11 @@ class TestCallTeardown:
 
     @pytest.mark.asyncio
     async def test_bridge_creation_failure_ends_call(self):
-        adapter = _make_adapter()
+        adapter = _make_adapter(allow_all_users="true")
 
-        async def fake_ari(method, path, params=None):
+        async def fake_ari(method, path, params=None, quiet_404=False):
             if path == "channels/externalMedia":
-                return {"id": "ext-1"}
+                return {"id": params.get("channelId")}
             if path == "bridges":
                 return None  # bridge creation fails
             return None
@@ -934,7 +994,8 @@ class TestCallTeardown:
         adapter._ari_request = AsyncMock(side_effect=fake_ari)
         adapter._end_call = AsyncMock()
         await adapter._on_stasis_start(
-            {"channel": {"id": "chan-C", "name": "PJSIP/obi200", "caller": {}}})
+            {"channel": {"id": "chan-C", "name": "PJSIP/obi200",
+                         "caller": {"number": "555"}}})
         adapter._end_call.assert_awaited_once_with("chan-C", hangup=True)
 
     @pytest.mark.asyncio
@@ -942,24 +1003,30 @@ class TestCallTeardown:
         adapter = _make_adapter()
         call = _Call("chan-1", "555")
         call.bridge_id = "br-1"
+        call.external_channel_id = "sip-media-x"
+        adapter._external_channels.add("sip-media-x")
+        adapter._external_owner["sip-media-x"] = "chan-1"
         call.writer = _FakeWriter()
-        call.playback_task = asyncio.ensure_future(asyncio.sleep(60))
+        call.synth_task = asyncio.ensure_future(asyncio.sleep(60))
         adapter._calls["chan-1"] = call
         adapter._uuid_to_channel[call.media_uuid] = "chan-1"
         deletes = []
         adapter._ari_request = AsyncMock(
-            side_effect=lambda m, p, params=None: deletes.append((m, p)))
+            side_effect=lambda m, p, params=None, quiet_404=False: deletes.append((m, p)))
 
         await adapter._end_call("chan-1", hangup=True)
 
         assert ("DELETE", "bridges/br-1") in deletes
+        assert ("DELETE", "channels/sip-media-x") in deletes   # media leg hung up
         assert ("DELETE", "channels/chan-1") in deletes
         assert call.writer.closed
-        # The in-flight playback task was cancelled; let it settle.
+        # The call's background tasks were cancelled; let them settle.
         with pytest.raises(asyncio.CancelledError):
-            await call.playback_task
+            await call.synth_task
         assert "chan-1" not in adapter._calls
         assert call.media_uuid not in adapter._uuid_to_channel
+        assert "sip-media-x" not in adapter._external_channels
+        assert "sip-media-x" not in adapter._external_owner
 
     @pytest.mark.asyncio
     async def test_end_call_unknown_channel_is_noop(self):
@@ -991,7 +1058,8 @@ class TestCallTeardown:
 
 class TestMoreRealBranches:
 
-    def test_attach_media_accepts_ascii_uuid_payload(self):
+    @pytest.mark.asyncio
+    async def test_attach_media_accepts_ascii_uuid_payload(self):
         # Some Asterisk builds send the UUID as an ASCII string, not 16 bytes.
         adapter = _make_adapter()
         call = _Call("chan-1", "555")
@@ -1001,6 +1069,7 @@ class TestMoreRealBranches:
         attached = adapter._attach_media(call.media_uuid.encode("ascii"), writer)
         assert attached is call
         assert call.writer is writer
+        await _cancel(call.synth_task, call.playout_task)
 
     @pytest.mark.asyncio
     async def test_synthesize_slin_empty_tts_file_returns_empty(self):
@@ -1023,3 +1092,132 @@ class TestMoreRealBranches:
         with patch.object(_sip.asyncio, "sleep", new=AsyncMock()):
             await adapter._stream_frames(call, b"\x01" * (SLIN_FRAME_BYTES * 2))
         assert bytes(call.writer.buf) == b""
+
+
+# ── New behaviors from the code review (half-duplex, teardown, media) ───────
+
+class TestReviewFixes:
+
+    def test_half_duplex_ignores_caller_while_speaking(self):
+        # Default barge_in=False: while a reply is playing, inbound audio is
+        # dropped (analog echo of our own TTS must not self-interrupt).
+        adapter = _make_adapter()
+        assert adapter.barge_in is False
+        call = _Call("chan-1", "555")
+        call.playing = True  # a reply is streaming
+        fed = []
+        call.detector = _OneShotDetector(b"X", after=1)
+        call.detector.reset = lambda: fed.append("reset")
+        adapter._handle_utterance = AsyncMock()
+        adapter._on_caller_audio(call, _frame(5000))
+        # Detector was reset (input discarded), no utterance task scheduled.
+        assert fed == ["reset"]
+        assert not call.utterance_tasks
+
+    def test_barge_in_flushes_playback(self):
+        adapter = _make_adapter(barge_in="true")
+        assert adapter.barge_in is True
+        call = _Call("chan-1", "555")
+        call.playing = True
+        call.pcm_queue.put_nowait((0, b"\x00" * 320))
+        call.detector = _OneShotDetector(b"utter", after=1)
+
+        async def drive():
+            adapter._handle_utterance = AsyncMock()
+            adapter._on_caller_audio(call, _frame(5000))
+            await asyncio.sleep(0)
+        asyncio.run(drive())
+        # Barge-in bumped the generation and flushed queued audio.
+        assert call.flush_generation == 1
+        assert call.pcm_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_media_leg_death_hangs_up_caller(self):
+        # StasisEnd for the externalMedia channel must tear down the caller
+        # leg, not leave it on a silent line.
+        adapter = _make_adapter()
+        call = _Call("chan-1", "555")
+        adapter._calls["chan-1"] = call
+        adapter._external_owner["sip-media-1"] = "chan-1"
+        adapter._external_channels.add("sip-media-1")
+        adapter._end_call = AsyncMock()
+        await adapter._dispatch_ari_event(
+            {"type": "StasisEnd", "channel": {"id": "sip-media-1"}})
+        adapter._end_call.assert_awaited_once_with("chan-1", hangup=True)
+
+    @pytest.mark.asyncio
+    async def test_send_image_speaks_caption_only(self):
+        adapter = _make_adapter()
+        call = _Call("chan-1", "555")
+        call.writer = _FakeWriter()
+        adapter._calls["chan-1"] = call
+        res = await adapter.send_image("chan-1", "https://x/y.png",
+                                       caption="a red square")
+        assert res.success is True
+        # The caption (real content) is queued to speak; the URL is not.
+        assert call.say_queue.get_nowait() == "a red square"
+
+    @pytest.mark.asyncio
+    async def test_send_document_without_caption_is_silent(self):
+        adapter = _make_adapter()
+        call = _Call("chan-1", "555")
+        call.writer = _FakeWriter()
+        adapter._calls["chan-1"] = call
+        res = await adapter.send_document("chan-1", "/tmp/report.pdf")
+        assert res.success is True
+        assert call.say_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_send_voice_decodes_and_queues_pcm(self):
+        adapter = _make_adapter()
+        call = _Call("chan-1", "555")
+        call.writer = _FakeWriter()
+        adapter._calls["chan-1"] = call
+        with patch.object(_sip, "_ffmpeg_to_slin",
+                          new=AsyncMock(return_value=b"\x00" * 320)):
+            res = await adapter.send_voice("chan-1", "/tmp/a.ogg")
+        assert res.success is True
+        assert call.pcm_queue.get_nowait()[1] == b"\x00" * 320
+
+    def test_auto_tts_disabled(self):
+        # Every reply is already spoken by send(); auto-TTS would double it.
+        adapter = _make_adapter()
+        assert adapter._should_auto_tts_for_chat("chan-1") is False
+
+    @pytest.mark.asyncio
+    async def test_synth_loop_strips_markdown(self):
+        adapter = _make_adapter()
+        call = _Call("chan-1", "555")
+        seen = []
+        adapter._synthesize_slin = AsyncMock(
+            side_effect=lambda s: seen.append(s) or b"\x00" * 320)
+        call.say_queue.put_nowait("Use **bold** and `code` now.")
+        task = asyncio.create_task(adapter._synth_loop(call))
+        await _drain_until(lambda: len(seen) >= 1)
+        await _cancel(task)
+        # Markdown markers were stripped before TTS.
+        assert seen and "**" not in seen[0] and "`" not in seen[0]
+
+    def test_caller_admission_allowlist(self):
+        adapter = _make_adapter(allowed_users="15551234567, 15559999999")
+        assert adapter._caller_allowed("15551234567") is True
+        assert adapter._caller_allowed("15550000000") is False
+        assert adapter._caller_allowed("") is False
+
+    def test_playout_loop_skips_stale_generation(self):
+        adapter = _make_adapter()
+        call = _Call("chan-1", "555")
+        call.writer = _FakeWriter()
+        streamed = []
+        adapter._stream_frames = AsyncMock(
+            side_effect=lambda c, pcm, gen=None: streamed.append(pcm))
+        # Queue one stale chunk (gen 0) then bump the generation past it.
+        call.pcm_queue.put_nowait((0, b"stale"))
+        call.flush_generation = 5
+
+        async def drive():
+            task = asyncio.create_task(adapter._playout_loop(call))
+            await _drain_until(lambda: call.pcm_queue.empty())
+            await _cancel(task)
+        asyncio.run(drive())
+        assert streamed == []  # stale audio was dropped, never streamed

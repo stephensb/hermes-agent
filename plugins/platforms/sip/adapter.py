@@ -18,8 +18,13 @@ Audio flow::
 
     caller speaks ─▶ AudioSocket PCM ─▶ VAD turn detector ─▶ WAV
                   ─▶ transcribe_audio() ─▶ handle_message() (agent loop)
-    agent reply  ─▶ send() ─▶ text_to_speech_tool() ─▶ ffmpeg 8k s16le
-                  ─▶ 320-byte frames ─▶ AudioSocket
+    agent reply  ─▶ send() ─▶ say queue ─▶ TTS ─▶ ffmpeg 8k s16le
+                  ─▶ PCM queue ─▶ 320-byte frames ─▶ AudioSocket
+
+Replies are spoken through a two-stage per-call pipeline (a synthesis task
+feeding a playout task through bounded queues) so that multiple ``send()``
+calls in one agent turn are spoken **in order** instead of cancelling each
+other, and sentence N+1 synthesizes while sentence N is still playing.
 
 The adapter is a plugin: it subclasses ``BasePlatformAdapter`` and registers
 via ``register(ctx)`` with zero changes to core Hermes code.  See
@@ -37,6 +42,10 @@ Configuration via environment variables (or ``config.yaml`` ``extra:``)::
                                 (default: 127.0.0.1)
     SIP_ALLOWED_USERS           comma-separated caller numbers allowed
     SIP_ALLOW_ALL_USERS         allow any caller (dev only)
+    SIP_BARGE_IN                let caller speech interrupt playback
+                                (default: false — half-duplex; the caller's
+                                line is ignored while Hermes is speaking, so
+                                analog echo can't trigger self-interruption)
     SIP_VAD_SILENCE_RMS         end-of-turn RMS threshold (default: 200)
     SIP_VAD_SILENCE_SECONDS     silence to end a turn      (default: 1.5)
 """
@@ -50,7 +59,8 @@ import tempfile
 import time
 import uuid as uuid_mod
 import wave
-from typing import Any, Dict, List, Optional, Tuple
+from collections import deque
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -58,9 +68,25 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.platforms.helpers import redact_phone
 from gateway.config import Platform
 
 logger = logging.getLogger(__name__)
+
+# numpy is optional (the [sip] extra provides it).  Import once at module
+# load — pcm_rms runs on every 20 ms frame, and a failed ``import numpy``
+# inside the function would re-run the import machinery 50×/sec per call.
+try:
+    import numpy as _np
+except Exception:  # pragma: no cover - environment-dependent
+    _np = None
+
+# Project-wide speech/silence RMS boundary.  tools/voice_mode.py owns the
+# constant; fall back to its documented value if the voice module moves.
+try:
+    from tools.voice_mode import SILENCE_RMS_THRESHOLD as _DEFAULT_SILENCE_RMS
+except Exception:  # pragma: no cover - environment-dependent
+    _DEFAULT_SILENCE_RMS = 200
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +105,10 @@ AS_KIND_ERROR = 0xff    # Asterisk → us: error
 SLIN_SAMPLE_RATE = 8000
 SLIN_FRAME_MS = 20
 SLIN_FRAME_BYTES = SLIN_SAMPLE_RATE * SLIN_FRAME_MS // 1000 * 2  # 320
+
+# Constant header for full outbound audio frames (precomputed once — the
+# playout loop writes 50 frames/sec per call).
+_SLIN_FRAME_HEADER = struct.pack(">BH", AS_KIND_SLIN, SLIN_FRAME_BYTES)
 
 
 def parse_audiosocket_frames(buffer: bytes) -> Tuple[List[Tuple[int, bytes]], bytes]:
@@ -119,8 +149,9 @@ def frame_pcm(pcm: bytes, frame_bytes: int = SLIN_FRAME_BYTES) -> List[bytes]:
     if frame_bytes <= 0:
         raise ValueError("frame_bytes must be positive")
     out: List[bytes] = []
+    view = memoryview(pcm)
     for i in range(0, len(pcm), frame_bytes):
-        chunk = pcm[i : i + frame_bytes]
+        chunk = bytes(view[i : i + frame_bytes])
         if len(chunk) < frame_bytes:
             chunk = chunk + b"\x00" * (frame_bytes - len(chunk))
         out.append(chunk)
@@ -130,27 +161,25 @@ def frame_pcm(pcm: bytes, frame_bytes: int = SLIN_FRAME_BYTES) -> List[bytes]:
 def pcm_rms(pcm: bytes) -> float:
     """Root-mean-square amplitude of signed-linear 16-bit mono PCM.
 
-    Uses numpy when available (fast path); falls back to pure Python so the
-    VAD remains importable in minimal environments.
+    Uses numpy when available (fast path); otherwise a zero-copy
+    memoryview cast.  Runs on every 20 ms inbound frame, so no imports or
+    large temporaries here.
     """
     if not pcm:
         return 0.0
-    try:
-        import numpy as np
-
-        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float64)
-        if samples.size == 0:
-            return 0.0
-        return float(np.sqrt(np.mean(samples * samples)))
-    except Exception:
-        # Pure-Python fallback (also covers numpy-less test envs).
-        count = len(pcm) // 2
-        if count == 0:
-            return 0.0
-        total = 0
-        for s in struct.unpack(f"<{count}h", pcm[: count * 2]):
-            total += s * s
-        return (total / count) ** 0.5
+    count = len(pcm) // 2
+    if count == 0:
+        return 0.0
+    if _np is not None:
+        try:
+            samples = _np.frombuffer(pcm, dtype=_np.int16).astype(_np.float64)
+            return float(_np.sqrt(_np.mean(samples * samples)))
+        except Exception:
+            pass  # fall through to the pure-Python path
+    total = 0
+    for s in memoryview(pcm)[: count * 2].cast("h"):
+        total += s * s
+    return (total / count) ** 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -169,31 +198,52 @@ class PhoneTurnDetector:
     utterance PCM (bytes) when the caller has spoken and then gone silent for
     ``silence_seconds``, otherwise ``None``.  A burst shorter than
     ``min_speech_seconds`` is treated as noise and discarded.
+
+    Buffering starts at the FIRST speech frame (tentatively) and a short
+    pre-roll of the preceding silence is prepended, so the leading syllable
+    of an utterance is never clipped while speech is still being confirmed.
+    ``max_utterance_seconds`` bounds the buffer: continuous sound above the
+    threshold (hold music, line hum) force-emits rather than growing forever.
     """
 
     def __init__(
         self,
         *,
         sample_rate: int = SLIN_SAMPLE_RATE,
-        silence_rms: float = 200.0,
+        silence_rms: float = float(_DEFAULT_SILENCE_RMS),
         silence_seconds: float = 1.5,
         min_speech_seconds: float = 0.3,
+        preroll_seconds: float = 0.2,
+        max_utterance_seconds: float = 60.0,
     ) -> None:
         self.sample_rate = sample_rate
         self.silence_rms = silence_rms
         self.silence_seconds = silence_seconds
         self.min_speech_seconds = min_speech_seconds
+        self.preroll_seconds = preroll_seconds
+        self.max_utterance_seconds = max_utterance_seconds
+        # Pre-roll ring buffer sized in 20 ms frames.
+        frames = max(1, int(preroll_seconds * 1000 / SLIN_FRAME_MS))
+        self._preroll: deque = deque(maxlen=frames)
         self.reset()
 
     def reset(self) -> None:
         self._buf = bytearray()
+        self._buf_seconds = 0.0
         self._speech_seconds = 0.0
         self._silence_seconds = 0.0
         self._in_speech = False
+        # NOTE: the pre-roll deque survives reset on purpose — it holds the
+        # most recent line audio regardless of turn boundaries.
 
     def _frame_seconds(self, pcm: bytes) -> float:
         samples = len(pcm) // 2
         return samples / float(self.sample_rate) if self.sample_rate else 0.0
+
+    def _emit(self) -> bytes:
+        utterance = bytes(self._buf)
+        self.reset()
+        return utterance
 
     def feed(self, pcm: bytes) -> Optional[bytes]:
         """Process one audio frame.  Returns a finished utterance or None."""
@@ -204,27 +254,40 @@ class PhoneTurnDetector:
         is_speech = rms >= self.silence_rms
 
         if is_speech:
+            if not self._buf and not self._in_speech:
+                # First (tentative) speech frame: prepend the pre-roll so the
+                # onset isn't clipped even before speech is confirmed.
+                for prev in self._preroll:
+                    self._buf.extend(prev)
+                    self._buf_seconds += self._frame_seconds(prev)
+                self._preroll.clear()
             self._speech_seconds += dur
             self._silence_seconds = 0.0
             if self._speech_seconds >= self.min_speech_seconds:
                 self._in_speech = True
-            # Always buffer once we are confidently in speech.
-            if self._in_speech:
-                self._buf.extend(pcm)
+            # Buffer from the first speech frame — discarded later if the
+            # burst never confirms (see the blip branch below).
+            self._buf.extend(pcm)
+            self._buf_seconds += dur
+            if self._buf_seconds >= self.max_utterance_seconds and self._in_speech:
+                return self._emit()
             return None
 
         # Silence frame.
         if self._in_speech:
             self._buf.extend(pcm)  # keep trailing silence inside the utterance
+            self._buf_seconds += dur
             self._silence_seconds += dur
             if self._silence_seconds >= self.silence_seconds:
-                utterance = bytes(self._buf)
-                self.reset()
-                return utterance
+                return self._emit()
         else:
-            # Not yet confidently in speech — decay the speech counter so a
-            # brief blip below min_speech does not eventually trigger.
+            # A sub-min_speech blip followed by silence: noise.  Drop the
+            # tentative buffer and keep rolling pre-roll context instead.
             self._speech_seconds = 0.0
+            if self._buf:
+                self._buf = bytearray()
+                self._buf_seconds = 0.0
+            self._preroll.append(pcm)
         return None
 
 
@@ -252,12 +315,13 @@ def _env_or_extra(extra: dict, env: str, key: str, default: Any = "") -> Any:
     return extra.get(key, default)
 
 
-def _as_bool(value: Any, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+def _ari_configured(extra: dict) -> bool:
+    """True when the three required ARI settings are present (env or extra)."""
+    return bool(
+        _env_or_extra(extra, "SIP_ARI_URL", "ari_url")
+        and _env_or_extra(extra, "SIP_ARI_USER", "ari_user")
+        and _env_or_extra(extra, "SIP_ARI_PASSWORD", "ari_password")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +331,8 @@ def _as_bool(value: Any, default: bool = False) -> bool:
 class _Call:
     """Bookkeeping for one in-flight phone call."""
 
-    def __init__(self, channel_id: str, caller: str) -> None:
+    def __init__(self, channel_id: str, caller: str,
+                 detector: Optional[PhoneTurnDetector] = None) -> None:
         self.channel_id = channel_id
         self.caller = caller or "unknown"
         # Canonical UUID string (8-4-4-4-12).  Asterisk's externalMedia ``data``
@@ -277,9 +342,21 @@ class _Call:
         self.bridge_id: Optional[str] = None
         self.external_channel_id: Optional[str] = None
         self.writer: Optional[asyncio.StreamWriter] = None
-        self.detector = PhoneTurnDetector()
-        self.playback_task: Optional[asyncio.Task] = None
-        self.recv_buf = b""
+        self.detector = detector or PhoneTurnDetector()
+        # Two-stage playback pipeline (see _synth_loop / _playout_loop).
+        self.say_queue: asyncio.Queue = asyncio.Queue()
+        self.pcm_queue: asyncio.Queue = asyncio.Queue(maxsize=4)
+        self.synth_task: Optional[asyncio.Task] = None
+        self.playout_task: Optional[asyncio.Task] = None
+        self.playing = False           # a PCM chunk is currently streaming
+        self.flush_generation = 0      # bumped by barge-in to abort playout
+        self.utterance_tasks: Set[asyncio.Task] = set()
+
+    def is_speaking(self) -> bool:
+        """True while any queued or in-flight reply audio remains."""
+        return (self.playing
+                or not self.pcm_queue.empty()
+                or not self.say_queue.empty())
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +365,11 @@ class _Call:
 
 class SIPAdapter(BasePlatformAdapter):
     """SIP voice bridge adapter (Asterisk ARI + AudioSocket)."""
+
+    # A phone call has no message editing; opting out keeps the gateway's
+    # streaming consumer from delivering partial chunks as separate send()
+    # calls (which would be spoken as stuttering, repeated speech).
+    SUPPORTS_MESSAGE_EDITING = False
 
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform("sip"))
@@ -313,14 +395,34 @@ class SIPAdapter(BasePlatformAdapter):
         # VAD tunables
         try:
             self.vad_silence_rms = float(_env_or_extra(
-                extra, "SIP_VAD_SILENCE_RMS", "vad_silence_rms", 200.0))
+                extra, "SIP_VAD_SILENCE_RMS", "vad_silence_rms",
+                float(_DEFAULT_SILENCE_RMS)))
         except (TypeError, ValueError):
-            self.vad_silence_rms = 200.0
+            self.vad_silence_rms = float(_DEFAULT_SILENCE_RMS)
         try:
             self.vad_silence_seconds = float(_env_or_extra(
                 extra, "SIP_VAD_SILENCE_SECONDS", "vad_silence_seconds", 1.5))
         except (TypeError, ValueError):
             self.vad_silence_seconds = 1.5
+
+        # Half-duplex by default: while Hermes is speaking, ignore the
+        # caller's line so analog echo (ATA hybrid, speakerphone) can't be
+        # mistaken for a barge-in and trigger self-interruption loops.
+        from utils import is_truthy_value
+        self.barge_in = is_truthy_value(
+            _env_or_extra(extra, "SIP_BARGE_IN", "barge_in", ""))
+
+        # Call-admission allowlist (checked at StasisStart, BEFORE the call
+        # is answered — the gateway authz layer still gates every message as
+        # defense in depth, but admission control means unauthorized callers
+        # never consume STT spend or hold a bridge open).
+        allowed_raw = _env_or_extra(extra, "SIP_ALLOWED_USERS", "allowed_users", "")
+        if isinstance(allowed_raw, str):
+            self.allowed_callers = {c.strip() for c in allowed_raw.split(",") if c.strip()}
+        else:
+            self.allowed_callers = {str(c).strip() for c in (allowed_raw or []) if str(c).strip()}
+        self.allow_all_callers = is_truthy_value(
+            _env_or_extra(extra, "SIP_ALLOW_ALL_USERS", "allow_all_users", ""))
 
         # Runtime state
         self._session = None  # aiohttp.ClientSession
@@ -330,6 +432,7 @@ class SIPAdapter(BasePlatformAdapter):
         self._calls: Dict[str, _Call] = {}            # channel_id -> _Call
         self._uuid_to_channel: Dict[str, str] = {}    # media_uuid -> channel_id
         self._external_channels: set = set()          # externalMedia channel ids
+        self._external_owner: Dict[str, str] = {}     # ext channel id -> caller channel id
 
     @property
     def name(self) -> str:
@@ -362,13 +465,17 @@ class SIPAdapter(BasePlatformAdapter):
             self._set_fatal_error("bind_failed", str(e), retryable=True)
             return False
 
+        # Basic auth on the session covers both the REST calls and the
+        # events-websocket handshake — never put the password in the URL,
+        # where it would leak into logged exception messages.
         self._session = aiohttp.ClientSession(
             auth=aiohttp.BasicAuth(self.ari_user, self.ari_password))
 
-        # Open the ARI event websocket subscribed to our Stasis app.
+        # Open the ARI event websocket subscribed to our Stasis app only
+        # (no subscribeAll: PBX-wide events would burn event-loop time that
+        # the 20 ms media path needs).
         ws_base = self.ari_url.replace("http://", "ws://").replace("https://", "wss://")
-        ws_url = (f"{ws_base}/ari/events?app={self.stasis_app}"
-                  f"&api_key={self.ari_user}:{self.ari_password}&subscribeAll=true")
+        ws_url = f"{ws_base}/ari/events?app={self.stasis_app}"
         try:
             self._ws = await self._session.ws_connect(ws_url, heartbeat=30)
         except Exception as e:
@@ -421,17 +528,23 @@ class SIPAdapter(BasePlatformAdapter):
     # ── ARI: call control ─────────────────────────────────────────────────
 
     async def _ari_request(self, method: str, path: str,
-                           params: Optional[dict] = None) -> Any:
-        """Issue an ARI REST request; returns parsed JSON or None."""
+                           params: Optional[dict] = None,
+                           quiet_404: bool = False) -> Any:
+        """Issue an ARI REST request; returns parsed JSON or None.
+
+        ``quiet_404`` suppresses the warning for expected-missing resources
+        (idempotent teardown DELETEs racing Asterisk's own cleanup).
+        """
         if self._session is None:
             return None
         url = f"{self.ari_url}/ari/{path.lstrip('/')}"
         try:
             async with self._session.request(method, url, params=params) as resp:
                 if resp.status >= 400:
-                    body = await resp.text()
-                    logger.warning("SIP: ARI %s %s → %s: %s",
-                                   method, path, resp.status, body[:200])
+                    if not (quiet_404 and resp.status == 404):
+                        body = await resp.text()
+                        logger.warning("SIP: ARI %s %s → %s: %s",
+                                       method, path, resp.status, body[:200])
                     return None
                 if resp.content_type == "application/json":
                     return await resp.json()
@@ -475,14 +588,34 @@ class SIPAdapter(BasePlatformAdapter):
             cid = channel.get("id")
             if cid in self._calls:
                 await self._end_call(cid, hangup=False)
+            elif cid in self._external_owner:
+                # The media leg died first (TCP reset, Asterisk error): the
+                # caller would otherwise sit on a silent line forever.  Hang
+                # the whole call up.
+                owner = self._external_owner.get(cid)
+                if owner in self._calls:
+                    logger.warning("SIP: media leg for call %s died — ending call", owner)
+                    await self._end_call(owner, hangup=True)
             self._external_channels.discard(cid)
+            self._external_owner.pop(cid, None)
+
+    def _caller_allowed(self, caller: str) -> bool:
+        """Call-admission check, mirroring the gateway env-allowlist policy."""
+        if self.allow_all_callers:
+            return True
+        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+            return True
+        return bool(caller) and caller in self.allowed_callers
 
     async def _on_stasis_start(self, event: dict) -> None:
         channel = event.get("channel", {})
         channel_id = channel.get("id")
         if not channel_id:
             return
-        # Ignore the externalMedia channel re-entering Stasis.
+        # Ignore our own externalMedia leg re-entering Stasis.  The id is
+        # pre-assigned before the POST (see below) so this check does not
+        # race the POST response; the name-prefix test is a fallback for
+        # channels created outside this adapter.
         if channel_id in self._external_channels:
             return
         name = channel.get("name", "")
@@ -491,16 +624,44 @@ class SIPAdapter(BasePlatformAdapter):
             return
 
         caller = (channel.get("caller") or {}).get("number") or ""
-        call = _Call(channel_id, caller)
+        if not self._caller_allowed(caller):
+            # Reject BEFORE answering: unauthorized callers never consume
+            # STT spend, never hold a bridge, and never reach the gateway's
+            # pairing prompt (which would read a pairing code aloud to a
+            # stranger).
+            logger.warning("SIP: rejecting unauthorized caller %s",
+                           redact_phone(caller))
+            await self._ari_request("DELETE", f"channels/{channel_id}",
+                                    quiet_404=True)
+            return
+
+        call = _Call(channel_id, caller, detector=PhoneTurnDetector(
+            silence_rms=self.vad_silence_rms,
+            silence_seconds=self.vad_silence_seconds))
         self._calls[channel_id] = call
         self._uuid_to_channel[call.media_uuid] = channel_id
 
-        logger.info("SIP: incoming call %s from %s", channel_id, caller or "unknown")
+        logger.info("SIP: incoming call %s from %s",
+                    channel_id, redact_phone(call.caller))
+
+        # Pre-assign the externalMedia channel id and register it BEFORE the
+        # POST: its StasisStart can arrive before the POST response, and the
+        # id (not a fragile name prefix) is what keeps it from being
+        # misclassified as a new inbound call.
+        ext_id = f"sip-media-{call.media_uuid}"
+        call.external_channel_id = ext_id
+        self._external_channels.add(ext_id)
+        self._external_owner[ext_id] = channel_id
 
         # Answer, then bridge the caller with an externalMedia (AudioSocket) leg.
         await self._ari_request("POST", f"channels/{channel_id}/answer")
+        if channel_id not in self._calls:
+            # Caller hung up while we were answering — nothing to clean up
+            # beyond what _end_call already did.
+            return
 
         ext = await self._ari_request("POST", "channels/externalMedia", params={
+            "channelId": ext_id,
             "app": self.stasis_app,
             "external_host": f"{self.advertise_host}:{self.bind_port}",
             "format": "slin",
@@ -513,8 +674,11 @@ class SIPAdapter(BasePlatformAdapter):
             logger.error("SIP: externalMedia creation failed for %s", channel_id)
             await self._end_call(channel_id, hangup=True)
             return
-        call.external_channel_id = ext["id"]
-        self._external_channels.add(ext["id"])
+        if channel_id not in self._calls:
+            # Caller hung up mid-setup: _end_call already ran and won't have
+            # seen the media leg attach, so drop it explicitly.
+            await self._ari_request("DELETE", f"channels/{ext_id}", quiet_404=True)
+            return
 
         bridge = await self._ari_request("POST", "bridges", params={"type": "mixing"})
         if not bridge or "id" not in bridge:
@@ -522,26 +686,42 @@ class SIPAdapter(BasePlatformAdapter):
             await self._end_call(channel_id, hangup=True)
             return
         call.bridge_id = bridge["id"]
+        if channel_id not in self._calls:
+            await self._ari_request("DELETE", f"bridges/{bridge['id']}", quiet_404=True)
+            await self._ari_request("DELETE", f"channels/{ext_id}", quiet_404=True)
+            return
         await self._ari_request(
             "POST", f"bridges/{call.bridge_id}/addChannel",
-            params={"channel": f"{channel_id},{call.external_channel_id}"})
+            params={"channel": f"{channel_id},{ext_id}"})
 
     async def _end_call(self, channel_id: str, *, hangup: bool) -> None:
         call = self._calls.pop(channel_id, None)
         if call is None:
             return
         self._uuid_to_channel.pop(call.media_uuid, None)
-        if call.playback_task and not call.playback_task.done():
-            call.playback_task.cancel()
+        for task in (call.synth_task, call.playout_task, *call.utterance_tasks):
+            if task and not task.done():
+                task.cancel()
+        call.utterance_tasks.clear()
         if call.writer is not None:
             try:
                 call.writer.close()
             except Exception:
                 pass
         if call.bridge_id:
-            await self._ari_request("DELETE", f"bridges/{call.bridge_id}")
+            await self._ari_request("DELETE", f"bridges/{call.bridge_id}",
+                                    quiet_404=True)
+        if call.external_channel_id:
+            # Normally the TCP close above hangs the media leg up; the
+            # explicit DELETE covers the setup paths where the socket never
+            # attached (quiet_404 keeps the common already-gone case silent).
+            await self._ari_request(
+                "DELETE", f"channels/{call.external_channel_id}", quiet_404=True)
+            self._external_channels.discard(call.external_channel_id)
+            self._external_owner.pop(call.external_channel_id, None)
         if hangup:
-            await self._ari_request("DELETE", f"channels/{channel_id}")
+            await self._ari_request("DELETE", f"channels/{channel_id}",
+                                    quiet_404=True)
         logger.info("SIP: call %s ended", channel_id)
 
     # ── AudioSocket: media ────────────────────────────────────────────────
@@ -565,7 +745,8 @@ class SIPAdapter(BasePlatformAdapter):
                         self._on_caller_audio(call, payload)
                     elif kind == AS_KIND_HANGUP:
                         if call is not None:
-                            await self._end_call(call.channel_id, hangup=False)
+                            await self._end_call(call.channel_id, hangup=True)
+                            call = None
                         return
                     elif kind == AS_KIND_ERROR:
                         logger.warning("SIP: AudioSocket error frame: %r", payload[:64])
@@ -578,6 +759,13 @@ class SIPAdapter(BasePlatformAdapter):
                 writer.close()
             except Exception:
                 pass
+            # Media socket gone: if the call is still live, the caller is on
+            # a dead line — hang the whole call up rather than leaving a
+            # zombie with a closed writer.
+            if call is not None and call.channel_id in self._calls:
+                logger.warning("SIP: media socket for call %s closed — ending call",
+                               call.channel_id)
+                await self._end_call(call.channel_id, hangup=True)
 
     def _attach_media(self, uuid_payload: bytes,
                      writer: asyncio.StreamWriter) -> Optional[_Call]:
@@ -600,39 +788,72 @@ class SIPAdapter(BasePlatformAdapter):
         call = self._calls.get(channel_id)
         if call is not None:
             call.writer = writer
-            call.detector = PhoneTurnDetector(
-                silence_rms=self.vad_silence_rms,
-                silence_seconds=self.vad_silence_seconds)
+            call.synth_task = asyncio.create_task(self._synth_loop(call))
+            call.playout_task = asyncio.create_task(self._playout_loop(call))
             logger.debug("SIP: media attached for call %s", channel_id)
         return call
 
     def _on_caller_audio(self, call: _Call, pcm: bytes) -> None:
+        if call.is_speaking():
+            if not self.barge_in:
+                # Half-duplex: while Hermes speaks, the inbound line carries
+                # analog echo of our own TTS — feeding it to the VAD would
+                # let the bot interrupt (and transcribe) itself.
+                call.detector.reset()
+                return
         utterance = call.detector.feed(pcm)
         if utterance is not None:
-            # Barge-in: a new utterance cancels any in-progress reply.
-            if call.playback_task and not call.playback_task.done():
-                call.playback_task.cancel()
-            asyncio.create_task(self._handle_utterance(call, utterance))
+            if self.barge_in and call.is_speaking():
+                self._flush_playback(call)
+            task = asyncio.create_task(self._handle_utterance(call, utterance))
+            # Hold a strong reference: asyncio keeps only weak refs to
+            # tasks, and an unreferenced STT/agent task can be GC'd
+            # mid-flight (the caller's turn would silently vanish).
+            call.utterance_tasks.add(task)
+            task.add_done_callback(call.utterance_tasks.discard)
 
-    async def _handle_utterance(self, call: _Call, pcm: bytes) -> None:
-        """STT a finished utterance and hand it to the agent loop."""
-        if not self._message_handler:
-            return
+    def _flush_playback(self, call: _Call) -> None:
+        """Abort in-flight and queued reply audio (barge-in)."""
+        call.flush_generation += 1
+        for q in (call.say_queue, call.pcm_queue):
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+    @staticmethod
+    def _transcribe_pcm(pcm: bytes) -> Dict[str, Any]:
+        """Blocking helper: write a temp WAV, run STT, clean up.
+
+        Runs inside asyncio.to_thread so neither the file I/O nor the STT
+        call touches the event loop that paces live audio.
+        """
+        from tools.transcription_tools import transcribe_audio
+
         wav_bytes = pcm_to_wav_bytes(pcm)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
             tf.write(wav_bytes)
             wav_path = tf.name
         try:
-            from tools.transcription_tools import transcribe_audio
-            result = await asyncio.to_thread(transcribe_audio, wav_path)
-        except Exception as e:
-            logger.warning("SIP: transcription failed — %s", e)
-            return
+            return transcribe_audio(wav_path)
         finally:
             try:
                 os.unlink(wav_path)
             except OSError:
                 pass
+
+    async def _handle_utterance(self, call: _Call, pcm: bytes) -> None:
+        """STT a finished utterance and hand it to the agent loop."""
+        if not self._message_handler:
+            return
+        try:
+            result = await asyncio.to_thread(self._transcribe_pcm, pcm)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("SIP: transcription failed — %s", e)
+            return
 
         text = (result or {}).get("transcript", "").strip()
         if not result or not result.get("success") or not text:
@@ -665,25 +886,53 @@ class SIPAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="No active call media for chat_id")
         if not content or not content.strip():
             return SendResult(success=True, message_id=str(int(time.time() * 1000)))
-
-        # Speak the reply on the call's media socket.  Replace any in-flight
-        # playback so the latest reply wins.
-        if call.playback_task and not call.playback_task.done():
-            call.playback_task.cancel()
-        call.playback_task = asyncio.create_task(self._speak(call, content))
+        # Enqueue — replies within a turn are spoken in order.  Barge-in
+        # (not replacement) is the only thing that cancels speech.
+        await call.say_queue.put(content)
         return SendResult(success=True, message_id=str(int(time.time() * 1000)))
 
-    async def _speak(self, call: _Call, text: str) -> None:
+    async def _synth_loop(self, call: _Call) -> None:
+        """Stage 1: texts from say_queue → sentence TTS → PCM into pcm_queue.
+
+        Runs for the call's lifetime.  Because this is a separate task from
+        playout, sentence N+1 synthesizes while sentence N is still playing —
+        no dead air between sentences beyond the first.
+        """
+        from tools.tts_tool import _strip_markdown_for_tts
+
         try:
-            for sentence in _split_sentences(text):
-                pcm = await self._synthesize_slin(sentence)
-                if not pcm:
-                    continue
-                await self._stream_frames(call, pcm)
+            while True:
+                text = await call.say_queue.get()
+                generation = call.flush_generation
+                spoken = _strip_markdown_for_tts(text)
+                for sentence in _split_sentences(spoken):
+                    if call.flush_generation != generation:
+                        break  # barge-in flushed this reply
+                    pcm = await self._synthesize_slin(sentence)
+                    if not pcm or call.flush_generation != generation:
+                        continue
+                    await call.pcm_queue.put((generation, pcm))
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.warning("SIP: playback error on call %s — %s", call.channel_id, e)
+            logger.warning("SIP: synth loop error on call %s — %s", call.channel_id, e)
+
+    async def _playout_loop(self, call: _Call) -> None:
+        """Stage 2: PCM chunks from pcm_queue → paced AudioSocket frames."""
+        try:
+            while True:
+                generation, pcm = await call.pcm_queue.get()
+                if generation != call.flush_generation:
+                    continue  # stale audio flushed by barge-in
+                call.playing = True
+                try:
+                    await self._stream_frames(call, pcm, generation)
+                finally:
+                    call.playing = False
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("SIP: playout loop error on call %s — %s", call.channel_id, e)
 
     async def _synthesize_slin(self, text: str) -> bytes:
         """TTS *text* and transcode to 8 kHz mono signed-linear PCM."""
@@ -691,39 +940,116 @@ class SIPAdapter(BasePlatformAdapter):
 
         tmp_audio = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
         tmp_audio.close()
+        produced_path = tmp_audio.name
         try:
             res = await asyncio.to_thread(text_to_speech_tool, text, tmp_audio.name)
             try:
                 parsed = json.loads(res) if isinstance(res, str) else res
             except (json.JSONDecodeError, TypeError):
                 parsed = None
-            if isinstance(parsed, dict) and parsed.get("success") is False:
-                logger.warning("SIP: TTS failed: %s", parsed.get("error"))
+            if isinstance(parsed, dict):
+                if parsed.get("success") is False:
+                    logger.warning("SIP: TTS failed: %s", parsed.get("error"))
+                    return b""
+                # Command/plugin TTS providers may write to a different path
+                # (e.g. the extension rewritten per output_format); the JSON
+                # carries the real location.
+                real = parsed.get("file_path")
+                if isinstance(real, str) and real:
+                    produced_path = real
+            if not os.path.exists(produced_path) or os.path.getsize(produced_path) == 0:
+                logger.warning("SIP: TTS produced no audio for sentence")
                 return b""
-            if not os.path.exists(tmp_audio.name) or os.path.getsize(tmp_audio.name) == 0:
-                return b""
-            return await _ffmpeg_to_slin(tmp_audio.name)
+            return await _ffmpeg_to_slin(produced_path)
         finally:
-            try:
-                os.unlink(tmp_audio.name)
-            except OSError:
-                pass
+            for path in {tmp_audio.name, produced_path}:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
-    async def _stream_frames(self, call: _Call, pcm: bytes) -> None:
+    async def _stream_frames(self, call: _Call, pcm: bytes,
+                             generation: Optional[int] = None) -> None:
         """Write 20 ms SLIN frames to the AudioSocket with real-time pacing."""
         writer = call.writer
         if writer is None:
             return
+        view = memoryview(pcm)
         next_t = time.monotonic()
-        for frame in frame_pcm(pcm):
+        for i in range(0, len(pcm), SLIN_FRAME_BYTES):
             if writer.is_closing():
                 return
-            writer.write(encode_audiosocket_frame(AS_KIND_SLIN, frame))
+            if generation is not None and generation != call.flush_generation:
+                return  # barge-in: stop mid-chunk
+            frame = view[i : i + SLIN_FRAME_BYTES]
+            if len(frame) < SLIN_FRAME_BYTES:
+                writer.write(encode_audiosocket_frame(AS_KIND_SLIN, bytes(frame)
+                             + b"\x00" * (SLIN_FRAME_BYTES - len(frame))))
+            else:
+                writer.write(_SLIN_FRAME_HEADER)
+                writer.write(frame)
             await writer.drain()
             next_t += SLIN_FRAME_MS / 1000.0
             delay = next_t - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
+
+    # ── Media senders ─────────────────────────────────────────────────────
+    #
+    # The base-class defaults for these send fallback TEXT ("⚠️ Couldn't
+    # deliver the audio attachment.", raw image URLs) through send(), which
+    # a phone caller would hear read aloud.  Voice attachments are playable;
+    # everything else speaks its caption (real content) and skips the file.
+
+    async def send_voice(self, chat_id: str, audio_path: str,
+                         caption: Optional[str] = None,
+                         reply_to: Optional[str] = None,
+                         metadata: Optional[Dict[str, Any]] = None,
+                         **kwargs) -> SendResult:
+        call = self._calls.get(chat_id)
+        if call is None or call.writer is None:
+            return SendResult(success=False, error="No active call media for chat_id")
+        pcm = await _ffmpeg_to_slin(audio_path)
+        if not pcm:
+            return SendResult(success=False, error="Could not decode audio for playback")
+        await call.pcm_queue.put((call.flush_generation, pcm))
+        return SendResult(success=True, message_id=str(int(time.time() * 1000)))
+
+    async def _speak_caption_only(self, chat_id: str,
+                                  caption: Optional[str]) -> SendResult:
+        if caption and caption.strip():
+            return await self.send(chat_id, caption)
+        return SendResult(success=True, message_id=str(int(time.time() * 1000)))
+
+    async def send_image(self, chat_id: str, image_url: str,
+                         caption: Optional[str] = None, reply_to=None,
+                         metadata=None, **kwargs) -> SendResult:
+        return await self._speak_caption_only(chat_id, caption)
+
+    async def send_image_file(self, chat_id: str, image_path: str,
+                              caption: Optional[str] = None, reply_to=None,
+                              metadata=None, **kwargs) -> SendResult:
+        return await self._speak_caption_only(chat_id, caption)
+
+    async def send_video(self, chat_id: str, video_path: str,
+                         caption: Optional[str] = None, reply_to=None,
+                         metadata=None, **kwargs) -> SendResult:
+        return await self._speak_caption_only(chat_id, caption)
+
+    async def send_animation(self, chat_id: str, animation_path: str,
+                             caption: Optional[str] = None, reply_to=None,
+                             metadata=None, **kwargs) -> SendResult:
+        return await self._speak_caption_only(chat_id, caption)
+
+    async def send_document(self, chat_id: str, document_path: str,
+                            caption: Optional[str] = None, reply_to=None,
+                            metadata=None, **kwargs) -> SendResult:
+        return await self._speak_caption_only(chat_id, caption)
+
+    def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
+        # Every SIP reply is already spoken by send(); the gateway's
+        # auto-TTS would synthesize a second, redundant audio file per turn.
+        return False
 
     # ── Misc required hooks ───────────────────────────────────────────────
 
@@ -741,20 +1067,37 @@ class SIPAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 def _split_sentences(text: str) -> List[str]:
-    """Split *text* into sentence-ish chunks to lower playback latency."""
-    import re
+    """Split *text* into sentence-ish chunks to lower playback latency.
+
+    Uses the same boundary regex as the streaming TTS pipeline in
+    tools/tts_tool.py so tuning fixes there reach the phone path too.
+    """
+    from tools.tts_tool import _SENTENCE_BOUNDARY_RE
 
     text = text.strip()
     if not text:
         return []
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    return [p.strip() for p in parts if p.strip()]
+    parts = _SENTENCE_BOUNDARY_RE.split(text)
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def _resolve_ffmpeg() -> str:
+    """Resolve the ffmpeg binary the way the rest of the codebase does
+    (Homebrew/local prefixes before PATH), falling back to plain 'ffmpeg'."""
+    try:
+        from tools.transcription_tools import _find_ffmpeg_binary
+        found = _find_ffmpeg_binary()
+        if found:
+            return found
+    except Exception:
+        pass
+    return "ffmpeg"
 
 
 async def _ffmpeg_to_slin(path: str) -> bytes:
     """Decode an audio file to raw 8 kHz mono s16le PCM via ffmpeg."""
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path,
+        _resolve_ffmpeg(), "-hide_banner", "-loglevel", "error", "-i", path,
         "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1",
         "-ar", str(SLIN_SAMPLE_RATE), "-",
     ]
@@ -785,21 +1128,13 @@ def check_requirements() -> bool:
 
 
 def validate_config(config) -> bool:
-    extra = getattr(config, "extra", {}) or {}
-    return bool(
-        _env_or_extra(extra, "SIP_ARI_URL", "ari_url")
-        and _env_or_extra(extra, "SIP_ARI_USER", "ari_user")
-        and _env_or_extra(extra, "SIP_ARI_PASSWORD", "ari_password")
-    )
+    """True when the platform config carries the required ARI settings."""
+    return _ari_configured(getattr(config, "extra", {}) or {})
 
 
-def is_connected(config) -> bool:
-    extra = getattr(config, "extra", {}) or {}
-    return bool(
-        _env_or_extra(extra, "SIP_ARI_URL", "ari_url")
-        and _env_or_extra(extra, "SIP_ARI_USER", "ari_user")
-        and _env_or_extra(extra, "SIP_ARI_PASSWORD", "ari_password")
-    )
+# Same predicate: "configured" is the best connectivity signal available
+# without instantiating the adapter.
+is_connected = validate_config
 
 
 def _env_enablement() -> Optional[dict]:
@@ -815,6 +1150,7 @@ def _env_enablement() -> Optional[dict]:
         ("SIP_AUDIOSOCKET_HOST", "audiosocket_host"),
         ("SIP_AUDIOSOCKET_PORT", "audiosocket_port"),
         ("SIP_AUDIOSOCKET_ADVERTISE_HOST", "audiosocket_advertise_host"),
+        ("SIP_BARGE_IN", "barge_in"),
         ("SIP_VAD_SILENCE_RMS", "vad_silence_rms"),
         ("SIP_VAD_SILENCE_SECONDS", "vad_silence_seconds"),
     ):
@@ -915,6 +1251,8 @@ def register(ctx):
         allowed_users_env="SIP_ALLOWED_USERS",
         allow_all_env="SIP_ALLOW_ALL_USERS",
         emoji="☎️",
-        pii_safe=False,
+        # Callers are identified by phone number: redact before the LLM,
+        # matching WhatsApp/Signal/BlueBubbles behavior.
+        pii_safe=True,
         platform_hint=_PLATFORM_HINT,
     )

@@ -73,6 +73,7 @@ export SIP_STASIS_APP=hermes
 export SIP_AUDIOSOCKET_ADVERTISE_HOST=HERMES_HOST   # reachable from Asterisk
 export SIP_AUDIOSOCKET_PORT=9092
 export SIP_ALLOWED_USERS=          # caller numbers; or SIP_ALLOW_ALL_USERS=true
+# export SIP_BARGE_IN=true        # let the caller interrupt Hermes mid-reply
 
 hermes gateway start
 ```
@@ -90,6 +91,10 @@ adapter listens.
 - **Turn-taking**: a caller's turn ends after `SIP_VAD_SILENCE_SECONDS` (1.5s
   default) of silence below `SIP_VAD_SILENCE_RMS` (200). Raise the RMS on a
   noisy line; lengthen the silence if callers get cut off mid-thought.
+- **Half-duplex vs barge-in**: by default the caller's line is ignored while
+  Hermes is speaking, so analog echo (ATA hybrid, speakerphone) can't make the
+  bot interrupt itself. Set `SIP_BARGE_IN=true` to let the caller cut in
+  mid-reply — only advisable on a clean handset with good echo cancellation.
 - **Latency**: long agent turns (tool calls, memory recall) feel bad on a phone.
   The adapter's platform hint already asks for short spoken replies; for the
   snappiest experience pair SIP with a fast model and a lean toolset.
