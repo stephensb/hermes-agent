@@ -48,6 +48,62 @@ outbound_auth = my-provider-auth
 aors = my-provider
 from_user = MY_DID_NUMBER
 
+; ── voip.ms (concrete example of Option A) ──────────────────────────────────
+; voip.ms is the common case for exactly this project: a home Asterisk box
+; behind NAT/dynamic IP, using a "Sub Account" (their name for registration-
+; based auth — matches Option A above, NOT their IP Authentication method,
+; which needs a static public IP you'd have to register in their portal).
+;
+; Setup on the voip.ms side (portal.voip.ms):
+;   1. Main Menu -> Sub Accounts -> Create Sub Account. Note the generated
+;      username (looks like "100000_hermes") and set a password.
+;   2. Main Menu -> DID Numbers -> your number -> Edit -> set routing to
+;      "Sub Account" -> pick the sub account you just created. This is the
+;      step that actually delivers inbound calls to Asterisk instead of
+;      voicemail/forwarding.
+;   3. Pick the POP (server) closest to you from voip.ms's server list
+;      (Account -> Server list) — e.g. "chicago4.voip.ms", "atlanta4.voip.ms",
+;      "montreal4.voip.ms". Latency matters for a live conversation, so don't
+;      just use the first one alphabetically.
+;
+[trunk-transport]
+type = transport
+protocol = udp
+bind = 0.0.0.0:5060
+
+[voipms]
+type = registration
+outbound_auth = voipms-auth
+server_uri = sip:SERVER_POP.voip.ms          ; <-- e.g. sip:chicago4.voip.ms
+client_uri = sip:SUBACCOUNT_USERNAME@SERVER_POP.voip.ms
+retry_interval = 60
+expiration = 3600
+
+[voipms-auth]
+type = auth
+auth_type = userpass
+username = SUBACCOUNT_USERNAME                ; <-- e.g. 100000_hermes
+password = SUBACCOUNT_PASSWORD
+
+[voipms]
+type = aor
+contact = sip:SERVER_POP.voip.ms
+qualify_frequency = 30
+
+[voipms]
+type = endpoint
+context = from-trunk                          ; <-- routes into Stasis, see below
+disallow = all
+allow = ulaw                                  ; voip.ms supports ulaw/alaw/g729;
+allow = alaw                                   ; ulaw needs no extra codec license
+outbound_auth = voipms-auth
+aors = voipms
+from_user = SUBACCOUNT_USERNAME
+; voip.ms sends the caller's number in the From/P-Asserted-Identity headers;
+; no special DTMF config is needed (RFC 4733 is the default and matches
+; voip.ms). If Caller ID doesn't populate CALLERID(num) for SIP_ALLOWED_USERS
+; filtering, add: dtmf_mode = rfc4733
+
 ; ── Option B: static-IP trunk (provider sends INVITEs directly, e.g. Twilio) ─
 ; Uncomment and adapt if your provider doesn't use registration.
 ;

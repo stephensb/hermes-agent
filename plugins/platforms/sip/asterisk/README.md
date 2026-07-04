@@ -135,6 +135,10 @@ to `pjsip.conf`, and add its `from-trunk` dialplan context to
 to an OBi200 call — same adapter, same pipeline, and `SIP_ALLOWED_USERS`
 still gates who's allowed to talk to Hermes by caller ID.
 
+**voip.ms** (a common choice for this exact setup — home Asterisk box, no
+static IP) has a ready-to-fill section in `pjsip_trunk.conf.example`: create a
+Sub Account, point the DID's routing at it, and pick a nearby server POP.
+
 ## Notes & tuning
 
 - **Codec**: the OBi200↔Asterisk leg uses G.711 (`ulaw`/`alaw`); Asterisk
