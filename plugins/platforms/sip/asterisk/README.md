@@ -62,6 +62,10 @@ On stock firmware (no third-party flash needed):
 Lift the handset → the OBi200 registers/dials SP1 → Asterisk runs
 `Stasis(hermes)` → the call connects to Hermes.
 
+**Note:** the OBi200 endpoint (`pjsip.conf`) also lets Hermes call it back —
+see "Outbound calls" below. No extra Asterisk config is needed for that; it
+reuses the endpoint the phone already registered.
+
 ## 3. Hermes
 
 Install the extra and set the environment (or run `hermes gateway setup` and
@@ -86,6 +90,50 @@ hermes gateway start
 media, so it must be routable from the PBX to the Hermes host (use `127.0.0.1`
 only when both run on the same machine). The bind host/port is where the
 adapter listens.
+
+## 4. Outbound calls (Hermes calls the OBi200)
+
+Any tool call or cron job that sends a message to the SIP platform makes
+Hermes **ring the phone** and speak the message once answered — the call
+then continues as a normal live conversation until either side hangs up.
+
+```python
+# From a tool / cron job (same generic send_message_tool every platform uses):
+send_message_tool(platform="sip", chat_id="obi200",
+                  message="Reminder: your dentist appointment is in an hour.")
+```
+
+```bash
+# Or via cron, with no explicit chat_id — rings SIP_HOME_CHANNEL
+# (defaults to SIP_OUTBOUND_ENDPOINT, i.e. the OBi200):
+cronjob(action="create", schedule="0 8 * * *", deliver="sip",
+       prompt="Remind me to take my medication")
+```
+
+No Asterisk config changes are needed — outbound calls dial the same
+`[obi200]` PJSIP endpoint via its existing registration (Asterisk reaches it
+at the Contact address it registered from). Relevant env vars:
+
+- `SIP_OUTBOUND_ENDPOINT` — which PJSIP endpoint to call (default: `obi200`).
+- `SIP_OUTBOUND_TIMEOUT_SECONDS` — how long to ring before giving up (default: `30`).
+- `SIP_HOME_CHANNEL` — the default destination for `deliver=sip` cron jobs
+  (defaults to `SIP_OUTBOUND_ENDPOINT`).
+
+If the phone doesn't answer (busy, no answer, rejected), the call is dropped
+cleanly — no error is raised to the caller; check the gateway log for
+`SIP: outbound call ... ended before answer`.
+
+## 5. Real phone numbers (PSTN inbound)
+
+To let people dial an actual phone number and reach Hermes — not just the
+OBi200 — add a SIP trunk to a VoIP/ITSP provider. This is provider-specific
+(registration vs. static-IP auth, DID formats all differ), so
+`pjsip_trunk.conf.example` in this directory is a **template**, not a
+drop-in config: fill in your provider's values, append the relevant section
+to `pjsip.conf`, and add its `from-trunk` dialplan context to
+`extensions.conf`. Once a trunk call reaches `Stasis(hermes)` it's identical
+to an OBi200 call — same adapter, same pipeline, and `SIP_ALLOWED_USERS`
+still gates who's allowed to talk to Hermes by caller ID.
 
 ## Notes & tuning
 

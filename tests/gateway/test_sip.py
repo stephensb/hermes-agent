@@ -45,6 +45,7 @@ AS_KIND_ERROR = _sip.AS_KIND_ERROR
 SLIN_FRAME_BYTES = _sip.SLIN_FRAME_BYTES
 _Call = _sip._Call
 MessageType = _sip.MessageType
+SendResult = _sip.SendResult
 
 
 def _make_adapter(**env):
@@ -1221,3 +1222,164 @@ class TestReviewFixes:
             await _cancel(task)
         asyncio.run(drive())
         assert streamed == []  # stale audio was dropped, never streamed
+
+
+# ── Outbound calling (Hermes rings the phone) ───────────────────────────────
+
+class TestOutboundCalls:
+
+    @pytest.mark.asyncio
+    async def test_originate_call_posts_ari_create_and_tracks_pending(self):
+        adapter = _make_adapter(ari_url="http://pbx:8088", ari_user="u", ari_password="p")
+        adapter._session = MagicMock()  # just needs to be non-None
+        captured = {}
+
+        async def fake_ari(method, path, params=None, quiet_404=False):
+            captured["method"], captured["path"], captured["params"] = method, path, params
+            return {"id": params["channelId"]}
+
+        adapter._ari_request = AsyncMock(side_effect=fake_ari)
+        res = await adapter.originate_call(destination="obi200", message="wake up")
+
+        assert res.success is True
+        assert captured["method"] == "POST"
+        assert captured["path"] == "channels"
+        assert captured["params"]["endpoint"] == "PJSIP/obi200"
+        assert captured["params"]["app"] == adapter.stasis_app
+        assert captured["params"]["appArgs"] == "outbound"
+        assert captured["params"]["timeout"] == adapter.outbound_timeout_seconds
+        channel_id = captured["params"]["channelId"]
+        assert adapter._pending_outbound[channel_id] == "wake up"
+        assert res.message_id == channel_id
+
+    @pytest.mark.asyncio
+    async def test_originate_call_defaults_to_configured_endpoint(self):
+        adapter = _make_adapter(outbound_endpoint="livingroom")
+        adapter._session = MagicMock()
+        captured = {}
+        adapter._ari_request = AsyncMock(
+            side_effect=lambda m, p, params=None, quiet_404=False:
+                captured.update(params) or {"id": params["channelId"]})
+        await adapter.originate_call()  # no destination -> configured default
+        assert captured["endpoint"] == "PJSIP/livingroom"
+
+    @pytest.mark.asyncio
+    async def test_originate_call_without_session_fails(self):
+        adapter = _make_adapter()
+        adapter._session = None
+        res = await adapter.originate_call(destination="obi200")
+        assert res.success is False
+
+    @pytest.mark.asyncio
+    async def test_originate_call_ari_failure_cleans_up_pending(self):
+        adapter = _make_adapter()
+        adapter._session = MagicMock()
+        adapter._ari_request = AsyncMock(return_value=None)  # ARI POST fails
+        res = await adapter.originate_call(destination="obi200", message="hi")
+        assert res.success is False
+        assert adapter._pending_outbound == {}   # no leaked pending entry
+
+    @pytest.mark.asyncio
+    async def test_send_to_non_live_chat_id_originates_call(self):
+        adapter = _make_adapter()
+        adapter.originate_call = AsyncMock(
+            return_value=SendResult(success=True, message_id="chan-x"))
+        res = await adapter.send("obi200", "reminder message")
+        adapter.originate_call.assert_awaited_once_with(
+            destination="obi200", message="reminder message")
+        assert res.success is True
+
+    @pytest.mark.asyncio
+    async def test_stasis_start_outbound_answer_admits_without_allowlist_check(self):
+        # No SIP_ALLOWED_USERS / SIP_ALLOW_ALL_USERS configured — an inbound
+        # call would be rejected, but an outbound (Hermes-originated) call
+        # must be admitted regardless, since Hermes placed it.
+        adapter = _make_adapter(outbound_endpoint="obi200")
+        channel_id = "chan-out-1"
+        adapter._pending_outbound[channel_id] = "hello, this is hermes"
+
+        async def fake_ari(method, path, params=None, quiet_404=False):
+            if path == "channels/externalMedia":
+                return {"id": params["channelId"]}
+            if path == "bridges":
+                return {"id": "br-1"}
+            return None
+
+        adapter._ari_request = AsyncMock(side_effect=fake_ari)
+        await adapter._on_stasis_start(
+            {"channel": {"id": channel_id, "name": "PJSIP/obi200"}})
+
+        assert channel_id not in adapter._pending_outbound  # popped
+        call = adapter._calls[channel_id]
+        assert call.outbound is True
+        assert call.caller == "obi200"
+        # The opening message was queued immediately (not gated on media
+        # attaching), preserving order against any racing send().
+        assert call.say_queue.get_nowait() == "hello, this is hermes"
+        # No explicit /answer call for an already-answered outbound leg.
+        methods = [c.args[:2] for c in adapter._ari_request.await_args_list]
+        assert ("POST", f"channels/{channel_id}/answer") not in methods
+
+    @pytest.mark.asyncio
+    async def test_stasis_start_outbound_without_message_queues_nothing(self):
+        adapter = _make_adapter()
+        channel_id = "chan-out-2"
+        adapter._pending_outbound[channel_id] = None
+
+        async def fake_ari(method, path, params=None, quiet_404=False):
+            if path == "channels/externalMedia":
+                return {"id": params["channelId"]}
+            if path == "bridges":
+                return {"id": "br-1"}
+            return None
+
+        adapter._ari_request = AsyncMock(side_effect=fake_ari)
+        await adapter._on_stasis_start({"channel": {"id": channel_id, "name": "x"}})
+        call = adapter._calls[channel_id]
+        assert call.say_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_pending_outbound_cleared_on_channel_destroyed_before_answer(self):
+        # The phone never answers (busy/no-answer/rejected): Asterisk still
+        # routes the event to our app-scoped stream since the channel was
+        # tagged with app= at creation time.
+        adapter = _make_adapter()
+        adapter._pending_outbound["chan-out-3"] = "never delivered"
+        await adapter._dispatch_ari_event(
+            {"type": "ChannelDestroyed", "channel": {"id": "chan-out-3"}})
+        assert "chan-out-3" not in adapter._pending_outbound
+        assert "chan-out-3" not in adapter._calls
+
+    def test_env_enablement_seeds_home_channel_default(self, monkeypatch):
+        for var in ("SIP_OUTBOUND_ENDPOINT", "SIP_HOME_CHANNEL"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("SIP_ARI_URL", "http://pbx:8088")
+        monkeypatch.setenv("SIP_ARI_USER", "hermes")
+        monkeypatch.setenv("SIP_ARI_PASSWORD", "secret")
+        seed = _env_enablement()
+        assert seed["home_channel"]["chat_id"] == "obi200"
+
+    def test_env_enablement_home_channel_override(self, monkeypatch):
+        monkeypatch.setenv("SIP_ARI_URL", "http://pbx:8088")
+        monkeypatch.setenv("SIP_ARI_USER", "hermes")
+        monkeypatch.setenv("SIP_ARI_PASSWORD", "secret")
+        monkeypatch.setenv("SIP_OUTBOUND_ENDPOINT", "livingroom")
+        monkeypatch.setenv("SIP_HOME_CHANNEL", "kitchen")
+        seed = _env_enablement()
+        assert seed["outbound_endpoint"] == "livingroom"
+        assert seed["home_channel"]["chat_id"] == "kitchen"
+
+    def test_register_wires_cron_deliver_env_var(self):
+        ctx = MagicMock()
+        register(ctx)
+        kwargs = ctx.register_platform.call_args.kwargs
+        assert kwargs["cron_deliver_env_var"] == "SIP_HOME_CHANNEL"
+        # No standalone sender — origination needs the live ARI connection.
+        assert "standalone_sender_fn" not in kwargs
+
+    def test_adapter_defaults_outbound_config(self, monkeypatch):
+        for var in ("SIP_OUTBOUND_ENDPOINT", "SIP_OUTBOUND_TIMEOUT_SECONDS"):
+            monkeypatch.delenv(var, raising=False)
+        adapter = _make_adapter()
+        assert adapter.outbound_endpoint == "obi200"
+        assert adapter.outbound_timeout_seconds == 30

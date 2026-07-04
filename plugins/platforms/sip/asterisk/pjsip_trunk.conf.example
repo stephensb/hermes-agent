@@ -1,0 +1,83 @@
+; EXAMPLE — SIP trunk template for routing a real phone number to Hermes.
+;
+; Unlike pjsip.conf (which is a working config for the OBi200), this is a
+; TEMPLATE: every VoIP/ITSP provider names things differently, and inbound
+; trunk auth is either registration-based (you register TO the provider,
+; common for residential/small-business VoIP) or static-IP-based (the
+; provider whitelists Asterisk's IP and sends INVITEs directly, common for
+; carrier-grade trunks like Twilio Elastic SIP Trunking). Fill in the
+; bracketed placeholders for YOUR provider, then append the relevant section
+; to pjsip.conf and the dialplan block below to extensions.conf.
+;
+; Once a call from the trunk hits Stasis(hermes), it is indistinguishable
+; from an OBi200 call — same adapter, same VAD/STT/TTS pipeline. The
+; SIP_ALLOWED_USERS allowlist (caller ID) still applies, so an open trunk
+; doesn't mean open access to Hermes.
+
+; ── Option A: registration-based trunk (you register TO the provider) ──────
+[trunk-transport]
+type = transport
+protocol = udp
+bind = 0.0.0.0:5060
+
+[my-provider]                         ; <-- pick any name
+type = registration
+outbound_auth = my-provider-auth
+server_uri = sip:sip.my-provider.example        ; <-- provider's SIP server
+client_uri = sip:MY_DID_NUMBER@sip.my-provider.example  ; <-- your number/account
+retry_interval = 60
+
+[my-provider-auth]
+type = auth
+auth_type = userpass
+username = MY_ITSP_USERNAME           ; <-- from your provider
+password = MY_ITSP_PASSWORD           ; <-- from your provider
+
+[my-provider]
+type = aor
+contact = sip:sip.my-provider.example
+qualify_frequency = 30
+
+[my-provider]
+type = endpoint
+context = from-trunk                  ; <-- routes into Stasis, see below
+disallow = all
+allow = ulaw
+allow = alaw
+outbound_auth = my-provider-auth
+aors = my-provider
+from_user = MY_DID_NUMBER
+
+; ── Option B: static-IP trunk (provider sends INVITEs directly, e.g. Twilio) ─
+; Uncomment and adapt if your provider doesn't use registration.
+;
+; [trunk-transport]
+; type = transport
+; protocol = udp
+; bind = 0.0.0.0:5060
+;
+; [twilio-identify]
+; type = identify
+; endpoint = twilio
+; match = PROVIDER_SIP_IP_OR_CIDR      ; <-- e.g. Twilio's published signaling IPs
+;
+; [twilio]
+; type = aor
+; contact = sip:PROVIDER_SIP_IP_OR_CIDR
+;
+; [twilio]
+; type = endpoint
+; context = from-trunk
+; disallow = all
+; allow = ulaw
+; aors = twilio
+
+; ── Dialplan: route the trunk's inbound calls into Hermes ──────────────────
+; Append to extensions.conf (alongside the existing [hermes-inbound]).
+; ${EXTEN} is the dialed DID; route it (or all DIDs) into the same Stasis app
+; the OBi200 uses — no separate Hermes-side config needed.
+;
+; [from-trunk]
+; exten => _X.,1,NoOp(Hermes: PSTN call to ${EXTEN} from ${CALLERID(num)})
+;  same => n,Stasis(hermes)
+;  same => n,Hangup()

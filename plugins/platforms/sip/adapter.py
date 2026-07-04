@@ -14,7 +14,7 @@ channels:
     16-bit mono PCM in 20 ms (320-byte) frames.  We stream synthesized speech
     back over the same socket.
 
-Audio flow::
+Audio flow (inbound — caller dials in)::
 
     caller speaks ─▶ AudioSocket PCM ─▶ VAD turn detector ─▶ WAV
                   ─▶ transcribe_audio() ─▶ handle_message() (agent loop)
@@ -26,9 +26,18 @@ feeding a playout task through bounded queues) so that multiple ``send()``
 calls in one agent turn are spoken **in order** instead of cancelling each
 other, and sentence N+1 synthesizes while sentence N is still playing.
 
+Outbound calls (Hermes rings the phone) work the other direction: any tool or
+cron job that calls ``send_message_tool`` / ``cronjob(deliver="sip", ...)``
+ends up at ``SIPAdapter.send(chat_id, content)`` like every other platform.
+If ``chat_id`` isn't a live call, ``send()`` treats it as a PJSIP endpoint
+name and originates a call via ARI (``originate_call``); once the phone
+answers, the *same* AudioSocket/VAD/TTS pipeline as an inbound call takes
+over, speaking ``content`` first and then continuing as a live conversation.
+
 The adapter is a plugin: it subclasses ``BasePlatformAdapter`` and registers
 via ``register(ctx)`` with zero changes to core Hermes code.  See
-``asterisk/README.md`` in this directory for the PBX + OBi200 wiring.
+``asterisk/README.md`` in this directory for the PBX + OBi200 wiring, and
+``asterisk/pjsip_trunk.conf.example`` for routing real PSTN numbers in.
 
 Configuration via environment variables (or ``config.yaml`` ``extra:``)::
 
@@ -48,6 +57,12 @@ Configuration via environment variables (or ``config.yaml`` ``extra:``)::
                                 analog echo can't trigger self-interruption)
     SIP_VAD_SILENCE_RMS         end-of-turn RMS threshold (default: 200)
     SIP_VAD_SILENCE_SECONDS     silence to end a turn      (default: 1.5)
+    SIP_OUTBOUND_ENDPOINT       PJSIP endpoint Hermes calls out to
+                                (default: obi200)
+    SIP_OUTBOUND_TIMEOUT_SECONDS  ring timeout for outbound calls
+                                (default: 30)
+    SIP_HOME_CHANNEL            default cron/send_message destination
+                                (default: SIP_OUTBOUND_ENDPOINT)
 """
 
 import asyncio
@@ -332,7 +347,8 @@ class _Call:
     """Bookkeeping for one in-flight phone call."""
 
     def __init__(self, channel_id: str, caller: str,
-                 detector: Optional[PhoneTurnDetector] = None) -> None:
+                 detector: Optional[PhoneTurnDetector] = None,
+                 *, outbound: bool = False) -> None:
         self.channel_id = channel_id
         self.caller = caller or "unknown"
         # Canonical UUID string (8-4-4-4-12).  Asterisk's externalMedia ``data``
@@ -350,6 +366,11 @@ class _Call:
         self.playout_task: Optional[asyncio.Task] = None
         self.playing = False           # a PCM chunk is currently streaming
         self.flush_generation = 0      # bumped by barge-in to abort playout
+        # True for calls Hermes originated (rings the OBi200) rather than
+        # calls the OBi200 placed to Hermes.  Outbound calls skip the
+        # caller-admission check (we placed the call) and are already
+        # answered by the time they enter Stasis.
+        self.outbound = outbound
         self.utterance_tasks: Set[asyncio.Task] = set()
 
     def is_speaking(self) -> bool:
@@ -424,6 +445,15 @@ class SIPAdapter(BasePlatformAdapter):
         self.allow_all_callers = is_truthy_value(
             _env_or_extra(extra, "SIP_ALLOW_ALL_USERS", "allow_all_users", ""))
 
+        # Outbound calling (Hermes rings the phone) — see originate_call().
+        self.outbound_endpoint = str(_env_or_extra(
+            extra, "SIP_OUTBOUND_ENDPOINT", "outbound_endpoint", "obi200"))
+        try:
+            self.outbound_timeout_seconds = int(_env_or_extra(
+                extra, "SIP_OUTBOUND_TIMEOUT_SECONDS", "outbound_timeout_seconds", 30))
+        except (TypeError, ValueError):
+            self.outbound_timeout_seconds = 30
+
         # Runtime state
         self._session = None  # aiohttp.ClientSession
         self._ws = None       # aiohttp ARI event websocket
@@ -433,6 +463,12 @@ class SIPAdapter(BasePlatformAdapter):
         self._uuid_to_channel: Dict[str, str] = {}    # media_uuid -> channel_id
         self._external_channels: set = set()          # externalMedia channel ids
         self._external_owner: Dict[str, str] = {}     # ext channel id -> caller channel id
+        # channel_id -> message to speak, for calls Hermes originated that
+        # haven't reached StasisStart yet (ringing/dialing).  Populated before
+        # the ARI create-channel POST so a StasisStart racing the POST
+        # response is still recognized as ours (same defensive pattern as
+        # _external_channels for the externalMedia leg).
+        self._pending_outbound: Dict[str, Optional[str]] = {}
 
     @property
     def name(self) -> str:
@@ -596,6 +632,13 @@ class SIPAdapter(BasePlatformAdapter):
                 if owner in self._calls:
                     logger.warning("SIP: media leg for call %s died — ending call", owner)
                     await self._end_call(owner, hangup=True)
+            elif cid in self._pending_outbound:
+                # An originated call that never reached StasisStart — busy,
+                # no answer, or rejected.  Asterisk routes these events to us
+                # because the channel was created with app=<our app>, even
+                # though it never actually entered the app.
+                logger.info("SIP: outbound call %s ended before answer (%s)", cid, etype)
+                self._pending_outbound.pop(cid, None)
             self._external_channels.discard(cid)
             self._external_owner.pop(cid, None)
 
@@ -623,6 +666,28 @@ class SIPAdapter(BasePlatformAdapter):
             self._external_channels.add(channel_id)
             return
 
+        if channel_id in self._pending_outbound:
+            # A call Hermes originated (see originate_call) just answered.
+            # It's already Up (the far end sent 200 OK) — no explicit answer
+            # needed, and it's inherently authorized: we placed it.
+            message = self._pending_outbound.pop(channel_id)
+            call = _Call(channel_id, self.outbound_endpoint, outbound=True,
+                        detector=PhoneTurnDetector(
+                            silence_rms=self.vad_silence_rms,
+                            silence_seconds=self.vad_silence_seconds))
+            self._calls[channel_id] = call
+            self._uuid_to_channel[call.media_uuid] = channel_id
+            if message:
+                # Enqueue now (not at media-attach time) so it stays first in
+                # line even if another send() races in before AudioSocket
+                # connects — say_queue is a plain FIFO, order doesn't depend
+                # on when the synth/playout tasks start draining it.
+                call.say_queue.put_nowait(message)
+            logger.info("SIP: outbound call %s to %s answered", channel_id,
+                       redact_phone(self.outbound_endpoint))
+            await self._attach_external_media_and_bridge(call)
+            return
+
         caller = (channel.get("caller") or {}).get("number") or ""
         if not self._caller_allowed(caller):
             # Reject BEFORE answering: unauthorized callers never consume
@@ -644,6 +709,23 @@ class SIPAdapter(BasePlatformAdapter):
         logger.info("SIP: incoming call %s from %s",
                     channel_id, redact_phone(call.caller))
 
+        # Answer, then bridge the caller with an externalMedia (AudioSocket) leg.
+        await self._ari_request("POST", f"channels/{channel_id}/answer")
+        if channel_id not in self._calls:
+            # Caller hung up while we were answering — nothing to clean up
+            # beyond what _end_call already did.
+            return
+        await self._attach_external_media_and_bridge(call)
+
+    async def _attach_external_media_and_bridge(self, call: _Call) -> None:
+        """Create the externalMedia (AudioSocket) leg and bridge it to *call*.
+
+        Shared by the inbound (caller dialed in) and outbound (Hermes
+        originated the call) paths — both need identical media plumbing once
+        the caller-facing channel is answered and admitted.
+        """
+        channel_id = call.channel_id
+
         # Pre-assign the externalMedia channel id and register it BEFORE the
         # POST: its StasisStart can arrive before the POST response, and the
         # id (not a fragile name prefix) is what keeps it from being
@@ -652,13 +734,6 @@ class SIPAdapter(BasePlatformAdapter):
         call.external_channel_id = ext_id
         self._external_channels.add(ext_id)
         self._external_owner[ext_id] = channel_id
-
-        # Answer, then bridge the caller with an externalMedia (AudioSocket) leg.
-        await self._ari_request("POST", f"channels/{channel_id}/answer")
-        if channel_id not in self._calls:
-            # Caller hung up while we were answering — nothing to clean up
-            # beyond what _end_call already did.
-            return
 
         ext = await self._ari_request("POST", "channels/externalMedia", params={
             "channelId": ext_id,
@@ -791,6 +866,8 @@ class SIPAdapter(BasePlatformAdapter):
             call.synth_task = asyncio.create_task(self._synth_loop(call))
             call.playout_task = asyncio.create_task(self._playout_loop(call))
             logger.debug("SIP: media attached for call %s", channel_id)
+            # Anything already queued (e.g. an outbound call's opening
+            # message, queued at Call-construction time) starts draining now.
         return call
 
     def _on_caller_audio(self, call: _Call, pcm: bytes) -> None:
@@ -882,14 +959,55 @@ class SIPAdapter(BasePlatformAdapter):
                    reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         call = self._calls.get(chat_id)
-        if call is None or call.writer is None:
-            return SendResult(success=False, error="No active call media for chat_id")
-        if not content or not content.strip():
+        if call is not None:
+            if not content or not content.strip():
+                return SendResult(success=True, message_id=str(int(time.time() * 1000)))
+            # Enqueue — replies within a turn are spoken in order.  Barge-in
+            # (not replacement) is the only thing that cancels speech.  Safe
+            # even before media attaches: say_queue is a plain FIFO, and
+            # _synth_loop starts draining it the moment AudioSocket connects.
+            await call.say_queue.put(content)
             return SendResult(success=True, message_id=str(int(time.time() * 1000)))
-        # Enqueue — replies within a turn are spoken in order.  Barge-in
-        # (not replacement) is the only thing that cancels speech.
-        await call.say_queue.put(content)
-        return SendResult(success=True, message_id=str(int(time.time() * 1000)))
+
+        # No live call at this chat_id: this is how cron/send_message_tool
+        # reach SIP (they call adapter.send(chat_id, content) on whatever
+        # live adapter is registered, generically, for every platform).
+        # Treat chat_id as a PJSIP endpoint name and ring it.
+        return await self.originate_call(destination=chat_id, message=content)
+
+    async def originate_call(self, destination: Optional[str] = None,
+                             message: Optional[str] = None) -> SendResult:
+        """Have Hermes call out to *destination* (a PJSIP endpoint name).
+
+        Defaults to ``SIP_OUTBOUND_ENDPOINT`` (the same endpoint the OBi200
+        registers as).  If *message* is given it is spoken as soon as the
+        call is answered and media attaches; the call then continues as a
+        normal live conversation until either side hangs up.
+        """
+        if self._session is None:
+            return SendResult(success=False, error="SIP adapter is not connected to ARI")
+        endpoint = (destination or self.outbound_endpoint or "").strip()
+        if not endpoint:
+            return SendResult(success=False, error="No destination endpoint configured")
+
+        channel_id = f"sip-out-{uuid_mod.uuid4().hex}"
+        self._pending_outbound[channel_id] = message
+
+        result = await self._ari_request("POST", "channels", params={
+            "endpoint": f"PJSIP/{endpoint}",
+            "app": self.stasis_app,
+            "appArgs": "outbound",
+            "channelId": channel_id,
+            "callerId": "Hermes",
+            "timeout": self.outbound_timeout_seconds,
+        })
+        if not result or "id" not in result:
+            self._pending_outbound.pop(channel_id, None)
+            logger.error("SIP: failed to originate call to %s", redact_phone(endpoint))
+            return SendResult(success=False,
+                             error=f"Could not originate call to {endpoint}")
+        logger.info("SIP: originating call %s to %s", channel_id, redact_phone(endpoint))
+        return SendResult(success=True, message_id=channel_id)
 
     async def _synth_loop(self, call: _Call) -> None:
         """Stage 1: texts from say_queue → sentence TTS → PCM into pcm_queue.
@@ -1153,10 +1271,20 @@ def _env_enablement() -> Optional[dict]:
         ("SIP_BARGE_IN", "barge_in"),
         ("SIP_VAD_SILENCE_RMS", "vad_silence_rms"),
         ("SIP_VAD_SILENCE_SECONDS", "vad_silence_seconds"),
+        ("SIP_OUTBOUND_ENDPOINT", "outbound_endpoint"),
+        ("SIP_OUTBOUND_TIMEOUT_SECONDS", "outbound_timeout_seconds"),
     ):
         val = os.getenv(env, "").strip()
         if val:
             seed[key] = val
+
+    # Default cron/send_message destination: the same endpoint the OBi200
+    # registers as, so `cronjob(deliver="sip", ...)` rings the phone without
+    # needing an explicit chat_id.  SIP_HOME_CHANNEL overrides it (e.g. a
+    # second registered endpoint used only for outbound notifications).
+    outbound_endpoint = os.getenv("SIP_OUTBOUND_ENDPOINT", "").strip() or "obi200"
+    home = os.getenv("SIP_HOME_CHANNEL", "").strip() or outbound_endpoint
+    seed["home_channel"] = {"chat_id": home, "name": f"Phone ({home})"}
     return seed
 
 
@@ -1255,4 +1383,11 @@ def register(ctx):
         # matching WhatsApp/Signal/BlueBubbles behavior.
         pii_safe=True,
         platform_hint=_PLATFORM_HINT,
+        # `cronjob(..., deliver="sip")` / `send_message_tool(platform="sip", ...)`
+        # with no explicit chat_id rings SIP_HOME_CHANNEL (default:
+        # SIP_OUTBOUND_ENDPOINT) — see originate_call() and _env_enablement().
+        # No standalone_sender_fn: origination needs the live ARI connection
+        # and AudioSocket server the running gateway process owns; there is
+        # no meaningful out-of-process equivalent.
+        cron_deliver_env_var="SIP_HOME_CHANNEL",
     )

@@ -9,8 +9,11 @@ description: >
   dialplan that hands the call to this adapter over ARI (call control) and
   AudioSocket/TCP (8 kHz signed-linear media). Caller speech is detected with a
   VAD turn-taker, transcribed, run through the shared agent loop, and the reply
-  is synthesized back onto the call. See asterisk/README.md for PBX + OBi200
-  wiring. Requires the [sip] extra (numpy) plus aiohttp and ffmpeg.
+  is synthesized back onto the call. Also supports outbound calling — cron
+  jobs or tools can have Hermes ring the phone and speak a message — and,
+  with a trunk added to Asterisk, real PSTN numbers can reach Hermes too. See
+  asterisk/README.md for PBX + OBi200 wiring and asterisk/pjsip_trunk.conf.example
+  for PSTN inbound. Requires the [sip] extra (numpy) plus aiohttp and ffmpeg.
 author: Nous Research
 # ``requires_env`` entries are surfaced in ``hermes config`` UI via the
 # platform-plugin env var injector in ``hermes_cli/config.py``.
@@ -59,4 +62,20 @@ optional_env:
   - name: SIP_VAD_SILENCE_SECONDS
     description: "Seconds of silence that end a caller's turn (default: 1.5)"
     prompt: "VAD silence seconds"
+    password: false
+  - name: SIP_BARGE_IN
+    description: "Let caller speech interrupt Hermes mid-reply (default: false — half-duplex)"
+    prompt: "Allow barge-in? (true/false)"
+    password: false
+  - name: SIP_OUTBOUND_ENDPOINT
+    description: "PJSIP endpoint Hermes calls out to for outbound calls (default: obi200)"
+    prompt: "Outbound endpoint name"
+    password: false
+  - name: SIP_OUTBOUND_TIMEOUT_SECONDS
+    description: "Ring timeout in seconds for outbound calls before giving up (default: 30)"
+    prompt: "Outbound ring timeout (seconds)"
+    password: false
+  - name: SIP_HOME_CHANNEL
+    description: "Default destination for cron/send_message outbound calls (defaults to SIP_OUTBOUND_ENDPOINT)"
+    prompt: "Home channel (endpoint name, or empty)"
     password: false
